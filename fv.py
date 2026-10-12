@@ -25,6 +25,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import termios
 import time
 
 CHUNK = 64 * 1024
@@ -293,6 +294,7 @@ class App:
         self.pgeom = None         # last drawn text-preview geometry (y0, x0, ph, gw, cw)
         self.init_colors()
         self.init_mouse()
+        self.init_tty()
         self.load_dir()
 
     def init_colors(self):
@@ -323,6 +325,17 @@ class App:
         if self.mouse:
             # ncurses only enables mode 1000 (clicks); 1002 adds motion while a button is held
             term_write("\x1b[?1002h")
+
+    def init_tty(self):
+        """Let Ctrl+Q/Ctrl+S reach the app (the tty normally eats them for flow control)."""
+        try:
+            fd = sys.stdin.fileno()
+            attrs = termios.tcgetattr(fd)
+            attrs[0] &= ~termios.IXON
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            curses.def_prog_mode()    # keep it across suspend/resume; endwin restores the shell's
+        except (termios.error, OSError, curses.error):
+            pass
 
     def attr(self, pair, extra=0):
         if not self.has_color or pair == 0:
@@ -482,7 +495,7 @@ class App:
             left += f"  {self.status}"
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
-        keys = "↑↓ move  ⏎ open  ⌫ up  j/k J/K spc/b g/G scroll  . hidden  q quit "
+        keys = "↑↓ move  ⏎ open  ⌫ up  j/k J/K spc/b g/G scroll  ^T hidden  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
         mid = f"  {info}  "
@@ -656,8 +669,6 @@ class App:
                 self.sel_cursor = self.file_pos(y, x)
                 if not self.moved and self.sel_cursor == self.press_pos:
                     self.clear_selection()   # plain click: no selection
-                else:
-                    self.copy_selection()
         elif bstate & curses.REPORT_MOUSE_POSITION:
             if self.dragging:
                 self.drag_yx = (y, x)
@@ -721,7 +732,7 @@ class App:
                 pass
             elif k == curses.KEY_MOUSE:
                 self.handle_mouse()
-            elif k in ("q", "Q"):
+            elif k == "\x11":                 # Ctrl+Q
                 break
             elif k == curses.KEY_UP:
                 self.move(-1)
@@ -755,7 +766,7 @@ class App:
                 self.ptop = 0
             elif k == "G":
                 self.scroll_preview("end", ph)
-            elif k == ".":
+            elif k == "\x14":                 # Ctrl+T: toggle hidden files
                 self.show_hidden = not self.show_hidden
                 cur = self.entries[self.sel][0] if self.entries else None
                 self.load_dir(focus=cur)
