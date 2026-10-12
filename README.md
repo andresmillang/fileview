@@ -31,7 +31,7 @@ python3 fv.py [DIRECTORY]
 | `.` | toggle hidden files |
 | Ctrl-L | redraw the screen |
 | mouse drag (preview) | select text; hold past the top/bottom edge to auto-scroll; copies on release |
-| `y` / Esc | copy the selection again / clear it |
+| `y` or Ctrl+C / Esc | copy the selection / clear it (Ctrl+C quits when nothing is selected) |
 | mouse wheel | scroll the panel under the pointer |
 | click (file list) | select an entry |
 

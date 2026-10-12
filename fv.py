@@ -12,7 +12,7 @@ Keys
   .                              toggle hidden files
   Ctrl-L                         redraw the screen
   mouse drag in preview          select text (auto-scrolls at the edges), copies on release
-  y / Esc                        copy selection again / clear selection
+  y or Ctrl-C / Esc              copy selection / clear selection (Ctrl-C quits if none)
   mouse wheel                    scroll the panel under the pointer
   q / Q                          quit
 """
@@ -711,6 +711,8 @@ class App:
                 k = self.scr.get_wch()
             except curses.error:
                 k = None                      # timeout tick while dragging
+            except KeyboardInterrupt:
+                k = "\x03"                    # Ctrl-C: copy if something is selected
             h, _, _ = self.layout()
             ph = max(1, h - 2)
             if k not in (None, curses.KEY_MOUSE):
@@ -761,6 +763,10 @@ class App:
                 curses.update_lines_cols()
             elif k == "\x0c":             # Ctrl-L: full repaint
                 self.scr.clear()
+            elif k == "\x03":
+                if not self.selection_range():
+                    break                     # nothing selected: Ctrl-C quits as before
+                self.copy_selection()
             elif k == "y":
                 self.copy_selection()
             elif k == "\x1b":
