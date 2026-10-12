@@ -23,10 +23,12 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Esc                          back to the file list (asks to save if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
-    Ctrl+C                       copy the selection (quits if nothing is selected)
+    Ctrl+C                       copy the selected text (in the preview; quits if nothing is selected)
     Esc                          clear the selection / typed name; back to the file list
     Ctrl+N                       create a new file in this folder
     F2                           rename the highlighted file or folder (Ctrl+U clears the name)
+    Ctrl+C / Ctrl+V (file list)  copy the marked (or highlighted) entries / paste them into this folder;
+                                 existing names are kept — copies get "(copy)" added
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
@@ -438,6 +440,7 @@ class App:
         self.prompt = None        # footer text input: [label, text, on_enter] (Ctrl+N, F2)
         self.marked = set()       # names marked in the file list (Space / Shift+arrows / Ctrl+click)
         self.pending_delete = None  # names waiting on the "Delete …? y/n" answer
+        self.file_clip = []       # absolute paths copied with Ctrl+C in the file list
         self.init_colors()
         self.init_mouse()
         self.init_tty()
@@ -741,7 +744,7 @@ class App:
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         if self.focus == "list":
-            keys = "type to find  ⏎ open  ⌫ up  Spc mark  Del delete  ^N new  ^Q quit "
+            keys = "Spc mark  ^C copy  ^V paste  Del delete  F2 rename  ^N new  ^Q quit "
         else:
             keys = "⇧ select  ^A all  ^C copy  ^V paste  ^Z undo  ^S save  Esc back  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
@@ -903,6 +906,7 @@ class App:
             return
         self.dragging = False
         self.sel_anchor, self.sel_cursor = (0, 0), (EOF_LINE, EOL)
+        self.set_focus("preview")      # so Ctrl+C next copies the text (in the list it copies files)
 
     def selection_size(self):
         """Byte size of the selection (upper bound for partial first/last lines)."""
@@ -1167,6 +1171,41 @@ class App:
             self.refresh_preview()
         self.status = f"deleted {done}" + (f"; not deleted: {'; '.join(failed)}" if failed else "")
 
+    def copy_files(self):
+        names = sorted(self.marked) if self.marked else (
+            [self.entries[self.sel][0]] if self.entries and self.entries[self.sel][0] != ".." else [])
+        if not names:
+            self.status = "nothing to copy"
+            return
+        self.file_clip = [os.path.join(self.cwd, n) for n in names]
+        what = names[0] if len(names) == 1 else f"{len(names)} items"
+        self.status = f"copied {what} — Ctrl+V in a folder to paste"
+
+    def paste_files(self):
+        if not self.file_clip:
+            self.status = "nothing to paste: copy files with Ctrl+C first"
+            return
+        done, failed, first = 0, [], None
+        for src in self.file_clip:
+            name = os.path.basename(src)
+            dest = os.path.join(self.cwd, unique_name(self.cwd, name))
+            try:
+                if os.path.isdir(src) and not os.path.islink(src):
+                    real = os.path.realpath(src)
+                    if os.path.realpath(self.cwd) == real or os.path.realpath(self.cwd).startswith(real + os.sep):
+                        failed.append(f"{name}: can't paste a folder into itself")
+                        continue
+                    shutil.copytree(src, dest, symlinks=True)
+                else:
+                    shutil.copy2(src, dest, follow_symlinks=False)
+                done += 1
+                first = first or os.path.basename(dest)
+            except (OSError, shutil.Error) as e:
+                failed.append(f"{name}: {getattr(e, 'strerror', None) or e}")
+        self.load_dir(focus=first)
+        self.status = f"pasted {done}" + (f" ({first}{', …' if done > 1 else ''})" if done else "") + (
+            f"; not pasted: {'; '.join(failed)}" if failed else "")
+
     def ask_rename(self):
         if not self.entries or self.entries[self.sel][0] == "..":
             self.status = "nothing to rename"
@@ -1395,7 +1434,8 @@ class App:
                     self.draw()
                     continue
                 k = action                                   # now carry out quit / leave / reload
-            discards = k in ("\x11", "\x14", "\x0e") or (k in ("\x1b", "\x03") and not self.selection_range())
+            discards = k in ("\x11", "\x14", "\x0e") or (
+                k in ("\x1b", "\x03") and not self.selection_range() and not (k == "\x03" and self.focus == "list"))
             if discards and self.unsaved():
                 self.confirm = k
                 name = os.path.basename(self.preview.path)
@@ -1412,6 +1452,10 @@ class App:
                 self.save()
             elif k == "\x0e":                 # Ctrl+N: new file in this folder
                 self.prompt = ["New file name: ", "", self.create_file]
+            elif self.focus == "list" and k == "\x03":    # Ctrl+C in the list: copy files
+                self.copy_files()
+            elif self.focus == "list" and k == "\x16":    # Ctrl+V in the list: paste files here
+                self.paste_files()
             elif k == curses.KEY_F2:              # F2: rename the highlighted entry
                 self.ask_rename()
             elif self.focus == "preview" and self.preview_key(k, ph):
@@ -1520,6 +1564,19 @@ def copy_to_clipboard(data):
         term_write(osc)
         used.append("OSC 52")
     return " + ".join(used)
+
+
+def unique_name(folder, name):
+    """name, or 'base (copy).ext', 'base (copy 2).ext', ... — whichever doesn't exist yet."""
+    if not os.path.lexists(os.path.join(folder, name)):
+        return name
+    base, ext = os.path.splitext(name)
+    n = 1
+    while True:
+        candidate = f"{base} (copy{'' if n == 1 else f' {n}'}){ext}"
+        if not os.path.lexists(os.path.join(folder, candidate)):
+            return candidate
+        n += 1
 
 
 def read_clipboard():
