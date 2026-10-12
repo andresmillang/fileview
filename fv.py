@@ -453,6 +453,7 @@ class App:
                 curses.init_pair(i, fg, bg)
             curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selection
             curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_WHITE)  # bars
+            curses.init_pair(11, curses.COLOR_BLACK, curses.COLOR_YELLOW) # questions to the user
 
     def init_mouse(self):
         try:
@@ -733,8 +734,10 @@ class App:
         start = w - len(keys)
         if start > len(left) + len(mid):
             self.put(h - 1, start, keys, len(keys) - 1, self.attr(10))
-        if self.prompt is not None:
-            self.put(h - 1, 0, (" " + "".join(self.prompt)).ljust(w), w, self.attr(10, curses.A_BOLD))
+        if self.prompt is not None or self.confirm is not None:      # a question: make it stand out
+            ask = "".join(self.prompt) if self.prompt is not None else self.status
+            loud = self.attr(11, curses.A_BOLD) if self.has_color else curses.A_REVERSE | curses.A_BOLD
+            self.put(h - 1, 0, (" " + ask).ljust(w), w, loud)
         self.place_cursor()
         self.scr.refresh()
 
