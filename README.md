@@ -48,7 +48,7 @@ python3 fv.py [DIRECTORY]
 |---|---|
 | Ctrl+A | select the whole previewed file |
 | Ctrl+C | copy the selection (quits if nothing is selected) |
-| Esc | clear the selection, or cancel a typed name |
+| Esc | clear the selection or cancel a typed name, and return to the file list |
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |

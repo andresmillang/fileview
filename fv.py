@@ -17,7 +17,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
   Anywhere
     Ctrl+A                       select the whole previewed file
     Ctrl+C                       copy the selection (quits if nothing is selected)
-    Esc                          clear the selection / typed name
+    Esc                          clear the selection / typed name; back to the file list
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
@@ -913,6 +913,7 @@ class App:
                 self.copy_selection()
             elif k == "\x1b":
                 self.clear_selection()
+                self.set_focus("list")            # back to the file list to pick another file
             self.autoscroll()
             self.draw()
         if self.preview:
