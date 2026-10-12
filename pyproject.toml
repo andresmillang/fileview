@@ -1,6 +1,6 @@
 [project]
 name = "fv"
-version = "0.2.1"
+version = "0.3.0"
 description = "Read-only terminal file explorer with a live preview pane"
 requires-python = ">=3.9"
 dependencies = []

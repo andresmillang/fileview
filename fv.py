@@ -4,17 +4,24 @@
 Left: directory listing.  Right: contents of the highlighted entry.
 Only the stdlib is required; Pygments (if installed) adds syntax highlighting.
 
-Keys
-  Up/Down, PgUp/PgDn, Home/End   move the selection
-  Enter / Right                  open directory
-  Backspace / Left               go to parent directory
-  j/k  J/K  space/b  g/G         scroll preview: line, 10 lines, page, top/bottom
-  .                              toggle hidden files
-  Ctrl-L                         redraw the screen
-  mouse drag in preview          select text (auto-scrolls at the edges), copies on release
-  y or Ctrl-C / Esc              copy selection / clear selection (Ctrl-C quits if none)
-  mouse wheel                    scroll the panel under the pointer
-  q / Q                          quit
+Keys (Tab or a mouse click picks the panel the keys act on)
+  File list
+    type letters                 jump to the first name starting with them (repeat a letter to cycle)
+    Up/Down, PgUp/PgDn, Home/End move the selection; the preview follows
+    Enter / Right                open directory, or focus the preview for a file
+    Backspace / Left             parent directory (Backspace edits the typed name while searching)
+  Preview
+    Up/Down, PgUp/PgDn, Home/End scroll
+    Left                         back to the file list
+    mouse drag                   select text (auto-scrolls at the top/bottom edge)
+  Anywhere
+    Ctrl+A                       select the whole previewed file
+    Ctrl+C                       copy the selection (quits if nothing is selected)
+    Esc                          clear the selection / typed name
+    Ctrl+T                       toggle hidden files
+    Ctrl+L                       redraw the screen
+    mouse wheel                  scroll the panel under the pointer
+    Ctrl+Q                       quit
 """
 import array
 import base64
