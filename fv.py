@@ -16,6 +16,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     mouse click / drag           place the cursor / select text (auto-scrolls at the edges)
     type, Enter, Tab             insert text      Backspace / Delete   delete
     Ctrl+V                       paste            Ctrl+S               save
+    Ctrl+Z                       undo (typing is undone a run at a time)
     Esc                          back to the file list (asks to save if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
@@ -150,6 +151,9 @@ class EditBuffer:
         self.newline = "\r\n" if self.ends and self.ends[0] == "\r\n" else "\n"
         self.eof = True
         self.dirty = False
+        self.history = []        # undo groups: {"before": cursor, "after": cursor, "recs": [...], "typing": bool}
+        self.group = None
+        self.save_point = None   # history top at the last save (None = unedited file)
 
     size = property(lambda self: len(self.to_bytes()))
 
@@ -184,6 +188,7 @@ class EditBuffer:
         l, c = pos
         pieces = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         before, after, end = self.text[l][:c], self.text[l][c:], self.ends[l]
+        self.record(l, l, len(pieces))
         self.dirty = True
         if len(pieces) == 1:
             self.text[l] = before + pieces[0] + after
@@ -193,8 +198,38 @@ class EditBuffer:
         self.ends[l:l + 1] = [nl] * (len(pieces) - 1) + [end]
         return l + len(pieces) - 1, len(pieces[-1])
 
+    def begin(self, cursor, typing):
+        """Start an undo step; consecutive typing at the cursor joins the previous step."""
+        top = self.history[-1] if self.history else None
+        if typing and top and top["typing"] and top["after"] == cursor and top is not self.save_point:
+            self.group = top
+        else:
+            self.group = {"before": cursor, "after": cursor, "recs": [], "typing": typing}
+            self.history.append(self.group)
+
+    def end(self, cursor):
+        self.group["after"] = cursor
+        if not self.group["recs"]:
+            self.history.remove(self.group)           # nothing changed: no empty undo step
+        self.group = None
+
+    def record(self, l0, l1, new_count):
+        """Remember lines l0..l1 before they are replaced by new_count lines."""
+        if self.group is not None:
+            self.group["recs"].append((l0, self.text[l0:l1 + 1], self.ends[l0:l1 + 1], new_count))
+
+    def undo(self):
+        """Revert the last step exactly; returns the cursor position before it."""
+        g = self.history.pop()
+        for l0, text, ends, n in reversed(g["recs"]):
+            self.text[l0:l0 + n] = text
+            self.ends[l0:l0 + n] = ends
+        self.dirty = (self.history[-1] if self.history else None) is not self.save_point
+        return g["before"]
+
     def delete(self, lo, hi):
         (l0, c0), (l1, c1) = lo, hi
+        self.record(l0, l1, 1)
         self.text[l0:l1 + 1] = [self.text[l0][:c0] + self.text[l1][c1:]]
         self.ends[l0:l1 + 1] = [self.ends[l1]]
         self.dirty = True
@@ -430,12 +465,17 @@ class App:
             term_write("\x1b[?1002h")
 
     def init_tty(self):
-        """Let Ctrl+Q/Ctrl+S/Ctrl+V reach the app (the tty normally eats them)."""
+        """Let Ctrl+Q/Ctrl+S/Ctrl+V/Ctrl+Z reach the app (the tty normally eats them)."""
         try:
             fd = sys.stdin.fileno()
             attrs = termios.tcgetattr(fd)
             attrs[0] &= ~termios.IXON
             attrs[3] &= ~termios.IEXTEN
+            try:
+                vdisable = os.fpathconf(fd, "PC_VDISABLE")
+            except (OSError, ValueError):
+                vdisable = 0
+            attrs[6][termios.VSUSP] = bytes([vdisable & 0xFF])   # Ctrl+Z = undo, not suspend
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
             curses.def_prog_mode()    # keep it across suspend/resume; endwin restores the shell's
         except (termios.error, OSError, curses.error):
@@ -680,7 +720,7 @@ class App:
         if self.focus == "list":
             keys = "type to find  ↑↓ move  ⏎ open  ⌫ up  Tab preview  ^T hidden  ^Q quit "
         else:
-            keys = "⇧+arrows select  ^A all  ^C copy  ^V paste  ^S save  Esc files  ^Q quit "
+            keys = "⇧ select  ^A all  ^C copy  ^V paste  ^Z undo  ^S save  Esc back  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
         mid = f"  {info}  "
@@ -996,6 +1036,8 @@ class App:
         self.clear_selection()
         self.kanchor = self.goal = None
         l, c = self.cur = self.clamp(self.cur)
+        typing = bool(text) and len(text) == 1 and text != "\n" and not span and not (back or forward)
+        buf.begin(self.cur, typing)
         if span and span[0] != span[1]:
             buf.delete(*span)
             self.cur = span[0]
@@ -1011,7 +1053,21 @@ class App:
                 buf.delete((l, c), (l + 1, 0))
         if text:
             self.cur = buf.insert(self.cur, text)
+        buf.end(self.cur)
         self.set_cursor(self.cur, ph)
+
+    def undo(self, ph):
+        p = self.preview
+        buf = p.file if p is not None and isinstance(p.file, EditBuffer) else None
+        if buf is None or not buf.history:
+            self.status = "nothing to undo"
+            return
+        pos = buf.undo()
+        self.clear_selection()
+        self.kanchor = self.goal = None
+        self.set_cursor(pos, ph)
+        left = len(buf.history)
+        self.status = f"undone ({left} more step{'s' * (left != 1)})" if left else "undone (back to the original)"
 
     def save(self):
         p = self.preview
@@ -1028,6 +1084,7 @@ class App:
             self.status = f"save failed: {e.strerror}"
             return
         p.file.dirty = False
+        p.file.save_point = p.file.history[-1] if p.file.history else None
         p.info = human(len(data)) + (f" · {p.lexer.name}" if p.lexer else "")
         self.status = f"saved {os.path.basename(p.path)} ({human(len(data))})"
 
@@ -1058,6 +1115,8 @@ class App:
             self.edit(ph, back=True)
         elif k == curses.KEY_DC:
             self.edit(ph, forward=True)
+        elif k == "\x1a":                     # Ctrl+Z
+            self.undo(ph)
         elif k == "\x16":                     # Ctrl+V
             self.paste(ph)
         elif isinstance(k, str) and (k.isprintable() or k == "\t"):

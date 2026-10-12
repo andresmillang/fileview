@@ -49,6 +49,7 @@ python3 fv.py [DIRECTORY]
 | type, Enter, Tab | insert text (a selection is replaced) |
 | Backspace / Delete | delete (a selection is deleted) |
 | Ctrl+V | paste from the system clipboard (your terminal's own paste, e.g. Ctrl+Shift+V, also works) |
+| Ctrl+Z | undo (a run of typing is undone in one step; undoing back to the last save clears `[modified]`) |
 | Ctrl+S | save the file |
 | Esc | back to the file list (with unsaved changes it asks: y = save, n = discard, Esc = cancel) |
 
