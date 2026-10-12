@@ -10,6 +10,9 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Up/Down, PgUp/PgDn, Home/End move the selection; the preview follows
     Enter / Right                open directory, or focus the preview for a file
     Backspace / Left             parent directory (Backspace edits the typed name while searching)
+    Space / Shift+Up/Down        mark entries (Ctrl+click too); Esc clears the marks
+    Del                          delete the marked entries (or the highlighted one) after a y/n question;
+                                 folders are only deleted when empty
   Preview (text cursor)
     arrows, PgUp/PgDn            move the cursor; Home/End = line start/end, Ctrl+Home/End = file
     Shift + any of those         select text
@@ -31,6 +34,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
 import array
 import base64
 import curses
+import errno
 import locale
 import os
 import shutil
@@ -431,6 +435,8 @@ class App:
         self.goal = None          # column Up/Down try to keep
         self.confirm = None       # action (key) waiting on the "save changes? y/n" answer
         self.prompt = None        # footer text input: [label, text] (Ctrl+N file name)
+        self.marked = set()       # names marked in the file list (Space / Shift+arrows / Ctrl+click)
+        self.pending_delete = None  # names waiting on the "Delete …? y/n" answer
         self.init_colors()
         self.init_mouse()
         self.init_tty()
@@ -453,7 +459,12 @@ class App:
                 curses.init_pair(i, fg, bg)
             curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selection
             curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_WHITE)  # bars
-            curses.init_pair(11, curses.COLOR_BLACK, curses.COLOR_YELLOW) # questions to the user
+            # questions to the user: pure black on bright yellow (palette 16/226 when available —
+            # themes don't remap those); no bold, which many terminals turn into grey text
+            if curses.COLORS >= 256:
+                curses.init_pair(11, 16, 226)
+            else:
+                curses.init_pair(11, curses.COLOR_BLACK, curses.COLOR_YELLOW)
 
     def init_mouse(self):
         try:
@@ -507,6 +518,7 @@ class App:
             self.entries.insert(0, ("..", True, False))   # "../" = go one folder up
         self.folded = [name.casefold() for name, _, _ in self.entries]
         self.find_buf = ""
+        self.marked = set()
         self.sel = 1 if len(self.entries) > 1 and self.entries[0][0] == ".." else 0
         if focus:
             for i, (name, _, _) in enumerate(self.entries):
@@ -682,6 +694,8 @@ class App:
         for row, i in enumerate(range(self.top, min(len(self.entries), self.top + body))):
             name, is_dir, is_link = self.entries[i]
             label = name + ("/" if is_dir else "") + ("@" if is_link and not is_dir else "")
+            if name in self.marked:
+                label = "✓ " + label
             if i == self.sel:
                 if self.focus == "list":
                     a = self.attr(9, curses.A_BOLD) if self.has_color else curses.A_REVERSE
@@ -689,7 +703,7 @@ class App:
                     a = self.attr(10) if self.has_color else curses.A_UNDERLINE
                 self.put(1 + row, 0, (" " + label).ljust(lw - 1), lw - 1, a)
             else:
-                a = self.attr(4) if is_dir else 0
+                a = self.attr(5, curses.A_BOLD) if name in self.marked else (self.attr(4) if is_dir else 0)
                 self.put(1 + row, 1, label, lw - 2, a)
 
         # divider + right pane
@@ -714,6 +728,8 @@ class App:
         if self.error and self.entries:
             left += f"  {self.error}"
         rng = self.selection_range()
+        if self.marked:
+            left += f"  {len(self.marked)} marked"
         if self.find_active():
             left += f"  find: {self.find_buf}"
         if self.status:
@@ -724,7 +740,7 @@ class App:
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         if self.focus == "list":
-            keys = "type to find  ⏎ open  ⌫ up  Tab preview  ^N new  ^T hidden  ^Q quit "
+            keys = "type to find  ⏎ open  ⌫ up  Spc mark  Del delete  ^N new  ^Q quit "
         else:
             keys = "⇧ select  ^A all  ^C copy  ^V paste  ^Z undo  ^S save  Esc back  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
@@ -734,9 +750,9 @@ class App:
         start = w - len(keys)
         if start > len(left) + len(mid):
             self.put(h - 1, start, keys, len(keys) - 1, self.attr(10))
-        if self.prompt is not None or self.confirm is not None:      # a question: make it stand out
+        if self.prompt is not None or self.confirm is not None or self.pending_delete:  # a question
             ask = "".join(self.prompt) if self.prompt is not None else self.status
-            loud = self.attr(11, curses.A_BOLD) if self.has_color else curses.A_REVERSE | curses.A_BOLD
+            loud = curses.color_pair(11) if self.has_color else curses.A_REVERSE | curses.A_BOLD
             self.put(h - 1, 0, (" " + ask).ljust(w), w, loud)
         self.place_cursor()
         self.scr.refresh()
@@ -1105,6 +1121,51 @@ class App:
         p.info = human(len(data)) + (f" · {p.lexer.name}" if p.lexer else "")
         self.status = f"saved {os.path.basename(p.path)} ({human(len(data))})"
 
+    def toggle_mark(self, i):
+        name = self.entries[i][0]
+        if name != "..":
+            self.marked ^= {name}
+
+    def mark_move(self, delta):
+        """Shift+↑/↓ in the list: mark the current entry, move, mark the new one."""
+        if self.entries and self.entries[self.sel][0] != "..":
+            self.marked.add(self.entries[self.sel][0])
+        self.move(delta)
+        if self.entries and self.entries[self.sel][0] != "..":
+            self.marked.add(self.entries[self.sel][0])
+
+    def ask_delete(self):
+        names = sorted(self.marked) if self.marked else (
+            [self.entries[self.sel][0]] if self.entries and self.entries[self.sel][0] != ".." else [])
+        if not names:
+            self.status = "nothing to delete"
+            return
+        kinds = {n: d for n, d, _ in self.entries}
+        shown = [n + ("/" if kinds.get(n) else "") for n in names]
+        what = shown[0] if len(shown) == 1 else f"{len(shown)} items ({', '.join(shown[:3])}{', …' if len(shown) > 3 else ''})"
+        self.pending_delete = names
+        self.status = f"Delete {what} permanently? y = yes, n = no"
+
+    def delete_files(self, names):
+        """Delete files / symlinks / empty folders; non-empty folders are left alone."""
+        done, failed = 0, []
+        for name in names:
+            path = os.path.join(self.cwd, name)
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    os.rmdir(path)
+                else:
+                    os.remove(path)
+                done += 1
+            except OSError as e:
+                failed.append(f"{name}: {'folder not empty' if e.errno == errno.ENOTEMPTY else e.strerror}")
+        keep = self.sel
+        self.load_dir()
+        if self.entries:
+            self.sel = min(keep, len(self.entries) - 1)
+            self.refresh_preview()
+        self.status = f"deleted {done}" + (f"; not deleted: {'; '.join(failed)}" if failed else "")
+
     def create_file(self, name):
         name = name.strip()
         if not name or "/" in name or name in (".", ".."):
@@ -1196,6 +1257,8 @@ class App:
             elif x < self.layout()[2] - 1 and 1 <= y < self.layout()[0] - 1:
                 idx = self.top + y - 1
                 if idx < len(self.entries):
+                    if bstate & curses.BUTTON_CTRL:
+                        self.toggle_mark(idx)
                     self.move(idx - self.sel)
         elif bstate & curses.BUTTON1_RELEASED:
             if self.dragging:
@@ -1273,6 +1336,14 @@ class App:
                 self.status = ""
             if self.find_buf and not self.find_active():
                 self.find_buf = ""
+            if self.pending_delete and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
+                names, self.pending_delete = self.pending_delete, None
+                if k in ("y", "Y"):
+                    self.delete_files(names)
+                else:
+                    self.status = "not deleted"
+                self.draw()
+                continue
             if self.prompt is not None and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
                 self.prompt_key(k)
                 self.draw()
@@ -1316,6 +1387,13 @@ class App:
             elif (self.focus == "list" and isinstance(k, str) and k.isprintable()
                   and (k != " " or self.find_buf)):
                 self.type_ahead(k)
+            elif self.focus == "list" and k == " " and self.entries:
+                self.toggle_mark(self.sel)                       # Space: mark / unmark, move on
+                self.move(1)
+            elif self.focus == "list" and k in (curses.KEY_SR, curses.KEY_SF):
+                self.mark_move(-1 if k == curses.KEY_SR else 1)
+            elif self.focus == "list" and k == curses.KEY_DC:
+                self.ask_delete()
             elif self.focus == "list" and self.find_buf and k in (
                     curses.KEY_BACKSPACE, "\x7f", "\b"):
                 self.find_backspace()
@@ -1354,6 +1432,8 @@ class App:
                 self.copy_selection()
             elif k == "\x1b":
                 self.clear_selection()
+                if self.focus == "list":
+                    self.marked = set()
                 if not self.unsaved():            # with unsaved edits Esc only drops the selection
                     self.set_focus("list")        # back to the file list to pick another file
             self.autoscroll()

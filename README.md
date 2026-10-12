@@ -10,6 +10,7 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - Friendly messages for binary, empty, unreadable, and special files
 - Type-to-navigate: type the start of a name to jump to it, like a graphical file browser
 - `../` at the top of every folder to go up one level; Ctrl+N creates a new file
+- Mark several files with Space and delete them with Del (always asks first; non-empty folders are never deleted)
 - Text selection inside the preview only: drag with the mouse (auto-scrolls past the edges) or
   Ctrl+A for the whole file; Ctrl+C copies the exact file text, line endings and indentation included
 - Lightweight editing in the preview: text cursor, Shift+arrow selection, typing, Ctrl+V paste,
@@ -38,6 +39,8 @@ python3 fv.py [DIRECTORY]
 | ↑ ↓ PgUp PgDn Home End | move the selection; the preview follows |
 | Enter / → | open a directory (or `../` to go one folder up), or move focus into the preview for a file |
 | Backspace / ← | parent directory (Backspace deletes a typed letter while searching) |
+| Space | mark / unmark the entry and move down (Shift+↑/↓ marks while moving; Ctrl+click toggles) |
+| Del | delete the marked entries, or the highlighted one, after a "Delete …? y/n" question; folders are only deleted when empty |
 
 **Preview**
 
@@ -60,7 +63,7 @@ python3 fv.py [DIRECTORY]
 |---|---|
 | Ctrl+A | select the whole previewed file |
 | Ctrl+C | copy the selection (quits if nothing is selected) |
-| Esc | clear the selection or cancel a typed name, and return to the file list |
+| Esc | clear the selection, marks or a typed name, and return to the file list |
 | Ctrl+N | create a new empty file in the current folder (asks for the name; Esc cancels) |
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
