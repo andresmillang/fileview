@@ -1,7 +1,7 @@
 # fv
 
-A read-only terminal file explorer with a live preview pane. Move the selection
-and the right pane immediately shows the highlighted file's contents.
+A terminal file explorer with a live preview pane. Move the selection and the right
+pane immediately shows the highlighted file's contents — and you can edit and save it.
 
 ![fv: live preview with a mouse selection in progress](docs/screenshot.svg)
 
@@ -11,7 +11,10 @@ and the right pane immediately shows the highlighted file's contents.
 - Type-to-navigate: type the start of a name to jump to it, like a graphical file browser
 - Text selection inside the preview only: drag with the mouse (auto-scrolls past the edges) or
   Ctrl+A for the whole file; Ctrl+C copies the exact file text, line endings and indentation included
-- Adapts to terminal resizing; never modifies anything
+- Lightweight editing in the preview: text cursor, Shift+arrow selection, typing, Ctrl+V paste,
+  Ctrl+S save. Files are only written when you press Ctrl+S; leaving with unsaved changes warns first.
+  Editing is limited to UTF-8 text files up to 10 MB (others stay view-only so they can't be corrupted)
+- Adapts to terminal resizing
 
 ## Install
 
@@ -38,9 +41,15 @@ python3 fv.py [DIRECTORY]
 
 | Key | Action |
 |---|---|
-| ↑ ↓ PgUp PgDn Home End | scroll |
-| ← | back to the file list |
-| mouse drag | select text; hold at or past the top/bottom edge to auto-scroll |
+| ← → ↑ ↓ PgUp PgDn | move the text cursor |
+| Home / End | start / end of the line (Ctrl+Home / Ctrl+End: start / end of the file) |
+| Shift + any of the above | select text |
+| mouse click / drag | place the cursor / select text; hold at or past the top/bottom edge to auto-scroll |
+| type, Enter, Tab | insert text (a selection is replaced) |
+| Backspace / Delete | delete (a selection is deleted) |
+| Ctrl+V | paste from the system clipboard (your terminal's own paste, e.g. Ctrl+Shift+V, also works) |
+| Ctrl+S | save the file |
+| Esc | back to the file list (with unsaved changes it warns; press Esc again to discard them) |
 
 **Anywhere**
 
@@ -52,7 +61,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |
-| Ctrl+Q | quit |
+| Ctrl+Q | quit (with unsaved changes it warns; press Ctrl+Q again to quit without saving) |
 
 Copying uses `wl-copy`, `xclip`, `xsel`, `pbcopy` or `clip.exe` when available, and also sends
 OSC 52 (up to 1 MB) so it works over SSH and in tmux, if the terminal allows clipboard writes.

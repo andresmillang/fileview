@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fv — a read-only terminal file explorer with a live preview pane.
+"""fv — a terminal file explorer with a live, editable preview pane.
 
 Left: directory listing.  Right: contents of the highlighted entry.
 Only the stdlib is required; Pygments (if installed) adds syntax highlighting.
@@ -10,10 +10,13 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Up/Down, PgUp/PgDn, Home/End move the selection; the preview follows
     Enter / Right                open directory, or focus the preview for a file
     Backspace / Left             parent directory (Backspace edits the typed name while searching)
-  Preview
-    Up/Down, PgUp/PgDn, Home/End scroll
-    Left                         back to the file list
-    mouse drag                   select text (auto-scrolls at the top/bottom edge)
+  Preview (text cursor)
+    arrows, PgUp/PgDn            move the cursor; Home/End = line start/end, Ctrl+Home/End = file
+    Shift + any of those         select text
+    mouse click / drag           place the cursor / select text (auto-scrolls at the edges)
+    type, Enter, Tab             insert text      Backspace / Delete   delete
+    Ctrl+V                       paste            Ctrl+S               save
+    Esc                          back to the file list (warns first if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
     Ctrl+C                       copy the selection (quits if nothing is selected)
@@ -46,6 +49,7 @@ OSC52_MAX = 1 << 20      # largest selection (bytes) also sent to the terminal c
 TYPEAHEAD_S = 1.0        # type-to-navigate buffer resets after this much inactivity
 EOF_LINE = 1 << 60       # selection line meaning "end of file" (Ctrl+A), never indexed
 COPY_MAX = 100 << 20     # refuse to copy selections larger than this
+EDIT_MAX = 10 << 20      # files up to this size (UTF-8 text) can be edited
 # keys that scroll the preview when it has focus
 PREVIEW_SCROLL = {curses.KEY_UP: "up", curses.KEY_DOWN: "down", curses.KEY_PPAGE: "pgup",
                   curses.KEY_NPAGE: "pgdn", curses.KEY_HOME: "home", curses.KEY_END: "end"}
@@ -116,6 +120,83 @@ class LazyFile:
 
     def index_all(self):
         self._index_until(sys.maxsize)
+
+    def span_size(self, l0, l1):
+        self._index_until(l1 + 1)
+        end = self.offsets[l1 + 1] if l1 + 1 < len(self.offsets) else self.size
+        return end - self.offsets[l0]
+
+    def read_all(self):
+        self.f.seek(0)
+        return self.f.read(COPY_MAX + 1)
+
+
+class EditBuffer:
+    """Editable in-memory copy of a UTF-8 text file, with the same read API as LazyFile.
+
+    Each line keeps its own original ending (\\n, \\r\\n or none) so saving is byte-faithful."""
+
+    def __init__(self, lazy):
+        text = lazy.read_all().decode("utf-8")          # UnicodeDecodeError -> not editable
+        parts = text.split("\n")
+        self.text, self.ends = [], []
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            if last and part == "" and i > 0:
+                break                                  # file ended with a newline
+            body = part[:-1] if part.endswith("\r") and not last else part
+            self.text.append(body)
+            self.ends.append("" if last else part[len(body):] + "\n")
+        self.newline = "\r\n" if self.ends and self.ends[0] == "\r\n" else "\n"
+        self.eof = True
+        self.dirty = False
+
+    size = property(lambda self: len(self.to_bytes()))
+
+    def close(self):
+        pass
+
+    def _index_until(self, n):
+        pass
+
+    index_all = _index_until
+
+    def count(self):
+        return len(self.text)
+
+    def lines(self, start, n):
+        return [t[:MAX_LINE] for t in self.text[start:start + n]]
+
+    def raw_line(self, i):
+        return self.text[i], self.ends[i]
+
+    def span_size(self, l0, l1):
+        return sum(len((self.text[i] + self.ends[i]).encode()) for i in range(l0, l1 + 1))
+
+    def to_bytes(self):
+        return "".join(t + e for t, e in zip(self.text, self.ends)).encode("utf-8")
+
+    read_all = to_bytes
+
+    def insert(self, pos, s):
+        """Insert s at (line, col); returns the position just after it."""
+        l, c = pos
+        pieces = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        before, after, end = self.text[l][:c], self.text[l][c:], self.ends[l]
+        self.dirty = True
+        if len(pieces) == 1:
+            self.text[l] = before + pieces[0] + after
+            return l, c + len(pieces[0])
+        nl = end or self.newline       # new line breaks match this line's (or the file's) style
+        self.text[l:l + 1] = [before + pieces[0]] + pieces[1:-1] + [pieces[-1] + after]
+        self.ends[l:l + 1] = [nl] * (len(pieces) - 1) + [end]
+        return l + len(pieces) - 1, len(pieces[-1])
+
+    def delete(self, lo, hi):
+        (l0, c0), (l1, c1) = lo, hi
+        self.text[l0:l1 + 1] = [self.text[l0][:c0] + self.text[l1][c1:]]
+        self.ends[l0:l1 + 1] = [self.ends[l1]]
+        self.dirty = True
 
 
 def sniff_binary(path):
@@ -309,6 +390,10 @@ class App:
         self.last_autoscroll = 0.0
         self.autoscroll_ticks = 0
         self.pgeom = None         # last drawn text-preview geometry (y0, x0, ph, gw, cw)
+        self.cur = (0, 0)         # text cursor in the preview, (line, col) in the file
+        self.kanchor = None       # where a Shift+arrow / mouse selection started
+        self.goal = None          # column Up/Down try to keep
+        self.confirm = None       # key pressed once to discard unsaved edits
         self.init_colors()
         self.init_mouse()
         self.init_tty()
@@ -344,11 +429,12 @@ class App:
             term_write("\x1b[?1002h")
 
     def init_tty(self):
-        """Let Ctrl+Q/Ctrl+S reach the app (the tty normally eats them for flow control)."""
+        """Let Ctrl+Q/Ctrl+S/Ctrl+V reach the app (the tty normally eats them)."""
         try:
             fd = sys.stdin.fileno()
             attrs = termios.tcgetattr(fd)
             attrs[0] &= ~termios.IXON
+            attrs[3] &= ~termios.IEXTEN
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
             curses.def_prog_mode()    # keep it across suspend/resume; endwin restores the shell's
         except (termios.error, OSError, curses.error):
@@ -390,13 +476,24 @@ class App:
             self.preview.close()
         self.ptop = 0
         self.clear_selection()
+        self.cur, self.kanchor, self.goal = (0, 0), None, None
         if self.entries:
             self.preview = Preview(os.path.join(self.cwd, self.entries[self.sel][0]), self.hl)
         else:
             self.preview = None
 
+    def unsaved(self):
+        p = self.preview
+        return p is not None and isinstance(p.file, EditBuffer) and p.file.dirty
+
+    def blocked(self):
+        if self.unsaved():
+            self.status = "unsaved changes: Ctrl+S to save, or press Esc twice to discard"
+            return True
+        return False
+
     def move(self, delta):
-        if not self.entries:
+        if not self.entries or self.blocked():
             return
         new = max(0, min(len(self.entries) - 1, self.sel + delta))
         if new != self.sel:
@@ -404,7 +501,7 @@ class App:
             self.refresh_preview()
 
     def enter(self):
-        if not self.entries:
+        if not self.entries or self.blocked():
             return
         name, is_dir, _ = self.entries[self.sel]
         if not is_dir:
@@ -467,6 +564,8 @@ class App:
         self.focus = panel
 
     def parent(self):
+        if self.blocked():
+            return
         parent = os.path.dirname(self.cwd)
         if parent != self.cwd:
             came_from = os.path.basename(self.cwd)
@@ -562,6 +661,8 @@ class App:
             total = self.preview_lines_total()
             more = "" if (self.preview.kind != "text" or self.preview.file.eof) else "+"
             info = f"{self.preview.info}  ln {self.ptop + 1}/{total}{more}"
+            if self.unsaved():
+                info += "  [modified]"
         left = f" {self.sel + 1 if self.entries else 0}/{len(self.entries)}"
         if self.error and self.entries:
             left += f"  {self.error}"
@@ -578,7 +679,7 @@ class App:
         if self.focus == "list":
             keys = "type to find  ↑↓ move  ⏎ open  ⌫ up  Tab preview  ^T hidden  ^Q quit "
         else:
-            keys = "↑↓ PgUp/PgDn Home/End scroll  ← Tab files  ^A all  ^C copy  ^Q quit "
+            keys = "⇧+arrows select  ^A all  ^C copy  ^V paste  ^S save  Esc files  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
         mid = f"  {info}  "
@@ -586,7 +687,27 @@ class App:
         start = w - len(keys)
         if start > len(left) + len(mid):
             self.put(h - 1, start, keys, len(keys) - 1, self.attr(10))
+        self.place_cursor()
         self.scr.refresh()
+
+    def place_cursor(self):
+        show = False
+        p, g = self.preview, self.pgeom
+        if self.focus == "preview" and p is not None and p.kind == "text" and g:
+            y0, x0, ph, gw, cw = g
+            l, c = self.cur
+            if self.ptop <= l < self.ptop + ph and cw > 0:
+                text = p.file.lines(l, 1)[0] if p.file.lines(l, 1) else ""
+                x = x0 + gw + min(display_cols(text)[min(c, len(text))], cw - 1)
+                try:
+                    self.scr.move(y0 + l - self.ptop, x)
+                    show = True
+                except curses.error:
+                    pass
+        try:
+            curses.curs_set(1 if show else 0)
+        except curses.error:
+            pass
 
     def draw_preview(self, y0, x0, ph, pw):
         p = self.preview
@@ -712,11 +833,7 @@ class App:
         """Byte size of the selection (upper bound for partial first/last lines)."""
         (l0, _), (l1, _) = self.selection_range()
         f = self.preview.file
-        if l1 == EOF_LINE:
-            return f.size
-        f._index_until(l1 + 1)
-        end = f.offsets[l1 + 1] if l1 + 1 < len(f.offsets) else f.size
-        return end - f.offsets[l0]
+        return f.size if l1 == EOF_LINE else f.span_size(l0, l1)
 
     def selection_text(self):
         rng = self.selection_range()
@@ -743,9 +860,7 @@ class App:
             self.status = f"not copied: selection is {human(size)} (limit {human(COPY_MAX)})"
             return
         if rng[1][0] == EOF_LINE:                 # whole file: copy the bytes exactly as stored
-            f = self.preview.file
-            f.f.seek(0)
-            data = f.f.read(COPY_MAX + 1)
+            data = self.preview.file.read_all()
             nlines = data.count(b"\n") + (0 if data.endswith(b"\n") or not data else 1)
         else:
             data = self.selection_text().encode("utf-8")
@@ -760,6 +875,196 @@ class App:
             self.status = (f"not copied: {what} exceeds the {human(OSC52_MAX)} terminal-clipboard "
                            "limit and no clipboard tool (wl-copy/xclip/xsel) was found")
 
+    # ---- text cursor, Shift+arrow selection, editing
+
+    def line_len(self, l):
+        return len(self.preview.file.raw_line(l)[0])
+
+    def has_line(self, l):
+        return l >= 0 and bool(self.preview.file.lines(l, 1))
+
+    def clamp(self, pos):
+        l, c = pos
+        f = self.preview.file
+        if not self.has_line(l):
+            f.index_all()
+            l = max(0, f.count() - 1)
+        return l, max(0, min(c, self.line_len(l)))
+
+    def set_cursor(self, pos, ph, extend=False):
+        if extend:
+            if self.kanchor is None or not self.selection_range():
+                self.kanchor = self.cur
+        else:
+            self.clear_selection()
+        self.cur = self.clamp(pos)
+        if extend:
+            lo, hi = sorted((self.kanchor, self.cur))
+            if lo == hi:
+                self.clear_selection()
+            else:                      # selection stores inclusive chars: end = char before hi
+                self.sel_anchor = lo
+                self.sel_cursor = (hi[0], hi[1] - 1) if hi[1] else (hi[0] - 1, EOL)
+        l = self.cur[0]
+        if l < self.ptop:
+            self.ptop = l
+        elif l >= self.ptop + ph:
+            self.ptop = l - ph + 1
+
+    def cursor_key(self, k, ph):
+        """Move the cursor for an arrow/page/home/end key (+Shift extends). True if handled."""
+        name = curses.keyname(k).decode() if isinstance(k, int) else ""
+        moves = {"KEY_LEFT": "left", "KEY_SLEFT": "left", "KEY_RIGHT": "right", "KEY_SRIGHT": "right",
+                 "KEY_UP": "up", "KEY_SR": "up", "KEY_DOWN": "down", "KEY_SF": "down",
+                 "KEY_PPAGE": "pgup", "KEY_SPREVIOUS": "pgup", "KEY_NPAGE": "pgdn", "KEY_SNEXT": "pgdn",
+                 "KEY_HOME": "home", "KEY_SHOME": "home", "KEY_END": "end", "KEY_SEND": "end",
+                 "kHOM5": "top", "kHOM6": "top", "kEND5": "bottom", "kEND6": "bottom"}
+        if name not in moves:
+            return False
+        extend = name.startswith("KEY_S") or name.endswith("6")
+        l, c = self.cur
+        m = moves[name]
+        if m in ("up", "down", "pgup", "pgdn"):
+            self.goal = c if self.goal is None else self.goal
+            dl = {"up": -1, "down": 1, "pgup": -ph, "pgdn": ph}[m]
+            if m in ("pgup", "pgdn"):
+                self.scroll_preview(dl, ph)
+            pos = (max(0, l + dl), self.goal)
+        else:
+            self.goal = None
+            if m == "left":
+                pos = (l, c - 1) if c > 0 else ((l - 1, EOL) if l > 0 else (0, 0))
+            elif m == "right":
+                pos = (l, c + 1) if c < self.line_len(l) else ((l + 1, 0) if self.has_line(l + 1) else (l, c))
+            elif m == "home":
+                pos = (l, 0)
+            elif m == "end":
+                pos = (l, EOL)
+            elif m == "top":
+                pos = (0, 0)
+            else:
+                pos = (EOF_LINE, EOL)
+        self.set_cursor(pos, ph, extend)
+        return True
+
+    def edit_buffer(self):
+        """The preview's EditBuffer, created on first edit; None (with a reason) if not editable."""
+        p = self.preview
+        if p is None or p.kind != "text":
+            self.status = "nothing to edit here"
+            return None
+        if isinstance(p.file, EditBuffer):
+            return p.file
+        if p.file.size > EDIT_MAX:
+            self.status = f"too large to edit ({human(p.file.size)}, limit {human(EDIT_MAX)})"
+        elif not os.access(p.path, os.W_OK):
+            self.status = "read-only: no permission to write this file"
+        else:
+            try:
+                buf = EditBuffer(p.file)
+            except UnicodeDecodeError:
+                self.status = "not UTF-8 text: editing disabled to avoid corrupting it"
+                return None
+            p.file.close()
+            p.file = buf
+            return buf
+        return None
+
+    def selection_span(self):
+        """Selection as half-open positions (lo, hi) in the buffer, or None."""
+        rng = self.selection_range()
+        if not rng:
+            return None
+        f = self.preview.file
+        (l0, c0), (l1, c1) = rng
+        if l1 == EOF_LINE:
+            l1 = f.count() - 1
+        lo = (l0, min(c0, self.line_len(l0)))
+        if c1 < self.line_len(l1):
+            hi = (l1, c1 + 1)
+        else:                          # through the end of the line: include its newline
+            hi = (l1 + 1, 0) if l1 + 1 < f.count() else (l1, self.line_len(l1))
+        return lo, hi
+
+    def edit(self, ph, text=None, back=False, forward=False):
+        """Insert text, or delete back/forward; a selection is replaced/deleted first."""
+        buf = self.edit_buffer()
+        if buf is None:
+            return
+        span = self.selection_span()
+        self.clear_selection()
+        self.kanchor = self.goal = None
+        l, c = self.cur = self.clamp(self.cur)
+        if span and span[0] != span[1]:
+            buf.delete(*span)
+            self.cur = span[0]
+        elif back:
+            if c > 0:
+                buf.delete((l, c - 1), (l, c)); self.cur = (l, c - 1)
+            elif l > 0:
+                p = (l - 1, len(buf.text[l - 1])); buf.delete(p, (l, 0)); self.cur = p
+        elif forward:
+            if c < len(buf.text[l]):
+                buf.delete((l, c), (l, c + 1))
+            elif l + 1 < buf.count():
+                buf.delete((l, c), (l + 1, 0))
+        if text:
+            self.cur = buf.insert(self.cur, text)
+        self.set_cursor(self.cur, ph)
+
+    def save(self):
+        p = self.preview
+        if not self.unsaved():
+            self.status = "no changes to save"
+            return
+        data = p.file.to_bytes()
+        try:
+            with open(p.path, "wb") as out:      # in place: keeps owner, mode and links
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+        except OSError as e:
+            self.status = f"save failed: {e.strerror}"
+            return
+        p.file.dirty = False
+        p.info = human(len(data)) + (f" · {p.lexer.name}" if p.lexer else "")
+        self.status = f"saved {os.path.basename(p.path)} ({human(len(data))})"
+
+    def paste(self, ph):
+        text = read_clipboard()
+        if text is None:
+            self.status = "no clipboard tool to paste from; use your terminal's paste (Ctrl+Shift+V)"
+        elif text:
+            self.edit(ph, text=text)
+
+    def preview_key(self, k, ph):
+        """Handle a key while the preview has focus. Returns True if consumed."""
+        p = self.preview
+        if p is None or p.kind != "text":
+            if k in PREVIEW_SCROLL:            # directory / message previews just scroll
+                action = PREVIEW_SCROLL[k]
+                if action == "home":
+                    self.ptop = 0
+                else:
+                    self.scroll_preview({"up": -1, "down": 1, "pgup": -ph, "pgdn": ph, "end": "end"}[action], ph)
+                return True
+            return False
+        if self.cursor_key(k, ph):
+            return True
+        if k in ("\n", "\r", curses.KEY_ENTER):
+            self.edit(ph, text="\n")
+        elif k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            self.edit(ph, back=True)
+        elif k == curses.KEY_DC:
+            self.edit(ph, forward=True)
+        elif k == "\x16":                     # Ctrl+V
+            self.paste(ph)
+        elif isinstance(k, str) and (k.isprintable() or k == "\t"):
+            self.edit(ph, text=k)
+        else:
+            return False
+        return True
+
     def handle_mouse(self):
         try:
             _, x, y, _, bstate = curses.getmouse()
@@ -768,6 +1073,8 @@ class App:
         p = self.preview
         text_preview = p is not None and p.kind == "text"
         if bstate & curses.BUTTON1_PRESSED:
+            if x < self.layout()[2] and self.blocked():
+                return
             self.set_focus("preview" if x >= self.layout()[2] else "list")
             if text_preview and self.in_preview(y, x):
                 self.status = ""
@@ -777,6 +1084,8 @@ class App:
                 self.sel_anchor = self.sel_cursor = self.file_pos(y, x)
                 self.press_pos = self.sel_anchor
                 self.moved = False
+                self.cur = self.kanchor = self.clamp(self.sel_anchor)
+                self.goal = None
             elif x < self.layout()[2] - 1 and 1 <= y < self.layout()[0] - 1:
                 idx = self.top + y - 1
                 if idx < len(self.entries):
@@ -788,6 +1097,8 @@ class App:
                 self.sel_cursor = self.file_pos(y, x)
                 if not self.moved and self.sel_cursor == self.press_pos:
                     self.clear_selection()   # plain click: no selection
+                else:
+                    self.cur = self.clamp(self.sel_cursor)
         elif bstate & curses.REPORT_MOUSE_POSITION:
             if self.dragging:
                 self.drag_yx = (y, x)
@@ -855,12 +1166,28 @@ class App:
                 self.status = ""
             if self.find_buf and not self.find_active():
                 self.find_buf = ""
+            discards = k in ("\x11", "\x14") or (k in ("\x1b", "\x03") and not self.selection_range())
+            if discards and self.unsaved():
+                if self.confirm != k:
+                    self.confirm = k
+                    name = {"\x1b": "Esc", "\x11": "Ctrl+Q", "\x14": "Ctrl+T", "\x03": "Ctrl+C"}[k]
+                    self.status = f"unsaved changes: Ctrl+S to save, or press {name} again to discard them"
+                    self.draw()
+                    continue
+                self.preview.file.dirty = False          # confirmed: drop the edits
+                self.refresh_preview()
+            if k not in (None, curses.KEY_MOUSE):
+                self.confirm = None
             if k is None:
                 pass
             elif k == curses.KEY_MOUSE:
                 self.handle_mouse()
             elif k == "\x11":                 # Ctrl+Q
                 break
+            elif k == "\x13":                 # Ctrl+S
+                self.save()
+            elif self.focus == "preview" and self.preview_key(k, ph):
+                pass
             elif k == "\t":
                 self.set_focus("preview" if self.focus == "list" else "list")
             elif (self.focus == "list" and isinstance(k, str) and k.isprintable()
@@ -871,15 +1198,6 @@ class App:
                 self.find_backspace()
             elif self.find_buf and k == "\x1b":
                 self.find_buf = ""
-            elif self.focus == "preview" and k in PREVIEW_SCROLL:
-                action = PREVIEW_SCROLL[k]
-                if action == "home":
-                    self.ptop = 0
-                else:
-                    step = {"up": -1, "down": 1, "pgup": -ph, "pgdn": ph, "end": "end"}[action]
-                    self.scroll_preview(step, ph)
-            elif self.focus == "preview" and k == curses.KEY_LEFT:
-                self.set_focus("list")
             elif k == curses.KEY_UP:
                 self.move(-1)
             elif k == curses.KEY_DOWN:
@@ -913,7 +1231,8 @@ class App:
                 self.copy_selection()
             elif k == "\x1b":
                 self.clear_selection()
-                self.set_focus("list")            # back to the file list to pick another file
+                if not self.unsaved():            # with unsaved edits Esc only drops the selection
+                    self.set_focus("list")        # back to the file list to pick another file
             self.autoscroll()
             self.draw()
         if self.preview:
@@ -964,6 +1283,24 @@ def copy_to_clipboard(data):
         term_write(osc)
         used.append("OSC 52")
     return " + ".join(used)
+
+
+def read_clipboard():
+    """Clipboard text via a system tool, or None if no tool is available."""
+    tools = []
+    if os.environ.get("WAYLAND_DISPLAY"):
+        tools.append(["wl-paste", "--no-newline"])
+    if os.environ.get("DISPLAY"):
+        tools += [["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]]
+    tools += [["pbpaste"], ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard -Raw"]]
+    for cmd in tools:
+        if shutil.which(cmd[0]):
+            try:
+                out = subprocess.run(cmd, capture_output=True, timeout=2, check=True).stdout
+                return out.decode("utf-8", "replace")
+            except (OSError, subprocess.SubprocessError):
+                continue
+    return None
 
 
 def sanitize(text, col):
