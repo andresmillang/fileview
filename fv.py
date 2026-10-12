@@ -37,6 +37,8 @@ EOL = 1 << 60            # selection column meaning "past the end of the line" (
 AUTOSCROLL_S = 0.04      # auto-scroll tick while dragging at/beyond the preview edge
 OSC52_MAX = 1 << 20      # largest selection (bytes) also sent to the terminal clipboard
 TYPEAHEAD_S = 1.0        # type-to-navigate buffer resets after this much inactivity
+EOF_LINE = 1 << 60       # selection line meaning "end of file" (Ctrl+A), never indexed
+COPY_MAX = 100 << 20     # refuse to copy selections larger than this
 # keys that scroll the preview when it has focus
 PREVIEW_SCROLL = {curses.KEY_UP: "up", curses.KEY_DOWN: "down", curses.KEY_PPAGE: "pgup",
                   curses.KEY_NPAGE: "pgdn", curses.KEY_HOME: "home", curses.KEY_END: "end"}
@@ -561,12 +563,15 @@ class App:
             left += f"  find: {self.find_buf}"
         if self.status:
             left += f"  {self.status}"
+        elif rng and rng[1][0] == EOF_LINE:
+            f = self.preview.file
+            left += f"  sel all ({f.count()} lines)" if f.eof else f"  sel all ({human(f.size)})"
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         if self.focus == "list":
             keys = "type to find  ↑↓ move  ⏎ open  ⌫ up  Tab preview  ^T hidden  ^Q quit "
         else:
-            keys = "↑↓ PgUp/PgDn Home/End scroll  ← Tab files  ^C copy  ^Q quit "
+            keys = "↑↓ PgUp/PgDn Home/End scroll  ← Tab files  ^A all  ^C copy  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
         mid = f"  {info}  "
@@ -688,6 +693,24 @@ class App:
             except curses.error:
                 pass
 
+    def select_all(self):
+        p = self.preview
+        if p is None or p.kind != "text":
+            self.status = "nothing to select"
+            return
+        self.dragging = False
+        self.sel_anchor, self.sel_cursor = (0, 0), (EOF_LINE, EOL)
+
+    def selection_size(self):
+        """Byte size of the selection (upper bound for partial first/last lines)."""
+        (l0, _), (l1, _) = self.selection_range()
+        f = self.preview.file
+        if l1 == EOF_LINE:
+            return f.size
+        f._index_until(l1 + 1)
+        end = f.offsets[l1 + 1] if l1 + 1 < len(f.offsets) else f.size
+        return end - f.offsets[l0]
+
     def selection_text(self):
         rng = self.selection_range()
         if not rng or self.preview is None or self.preview.kind != "text":
@@ -705,13 +728,30 @@ class App:
         return "".join(out)
 
     def copy_selection(self):
-        text = self.selection_text()
-        if not text:
-            return
         rng = self.selection_range()
-        nlines = rng[1][0] - rng[0][0] + 1
-        how = copy_to_clipboard(text)
-        self.status = f"copied {nlines} line{'s' * (nlines != 1)} ({human(len(text.encode()))}) → {how}"
+        if not rng or self.preview is None or self.preview.kind != "text":
+            return
+        size = self.selection_size()
+        if size > COPY_MAX:
+            self.status = f"not copied: selection is {human(size)} (limit {human(COPY_MAX)})"
+            return
+        if rng[1][0] == EOF_LINE:                 # whole file: copy the bytes exactly as stored
+            f = self.preview.file
+            f.f.seek(0)
+            data = f.f.read(COPY_MAX + 1)
+            nlines = data.count(b"\n") + (0 if data.endswith(b"\n") or not data else 1)
+        else:
+            data = self.selection_text().encode("utf-8")
+            nlines = rng[1][0] - rng[0][0] + 1
+        if not data:
+            return
+        how = copy_to_clipboard(data)
+        what = f"{nlines} line{'s' * (nlines != 1)} ({human(len(data))})"
+        if how:
+            self.status = f"copied {what} → {how}"
+        else:
+            self.status = (f"not copied: {what} exceeds the {human(OSC52_MAX)} terminal-clipboard "
+                           "limit and no clipboard tool (wl-copy/xclip/xsel) was found")
 
     def handle_mouse(self):
         try:
@@ -858,6 +898,8 @@ class App:
                 curses.update_lines_cols()
             elif k == "\x0c":             # Ctrl-L: full repaint
                 self.scr.clear()
+            elif k == "\x01":                 # Ctrl+A: select the whole file
+                self.select_all()
             elif k == "\x03":
                 if not self.selection_range():
                     break                     # nothing selected: Ctrl-C quits as before
@@ -887,9 +929,10 @@ def term_write(seq):
         pass
 
 
-def copy_to_clipboard(text):
-    """Copy via a system clipboard tool if present, and via OSC 52 (works over SSH/tmux)."""
-    data = text.encode("utf-8")
+def copy_to_clipboard(data):
+    """Copy bytes via a system clipboard tool if present, and via OSC 52 (works over SSH/tmux).
+
+    Returns how it was copied, or "" if no route could take it."""
     tools = []
     if os.environ.get("WAYLAND_DISPLAY"):
         tools.append(["wl-copy"])
@@ -912,7 +955,7 @@ def copy_to_clipboard(text):
             osc = b"\x1bPtmux;\x1b" + osc + b"\x1b\\"
         term_write(osc)
         used.append("OSC 52")
-    return " + ".join(used) if used else "no clipboard available"
+    return " + ".join(used)
 
 
 def sanitize(text, col):
