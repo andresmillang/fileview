@@ -1,6 +1,6 @@
 [project]
 name = "fv"
-version = "0.4.0"
+version = "0.4.1"
 description = "Terminal file explorer with a live, editable preview pane"
 requires-python = ">=3.9"
 dependencies = []

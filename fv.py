@@ -16,7 +16,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     mouse click / drag           place the cursor / select text (auto-scrolls at the edges)
     type, Enter, Tab             insert text      Backspace / Delete   delete
     Ctrl+V                       paste            Ctrl+S               save
-    Esc                          back to the file list (warns first if there are unsaved changes)
+    Esc                          back to the file list (asks to save if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
     Ctrl+C                       copy the selection (quits if nothing is selected)
@@ -159,7 +159,8 @@ class EditBuffer:
     def _index_until(self, n):
         pass
 
-    index_all = _index_until
+    def index_all(self):
+        pass
 
     def count(self):
         return len(self.text)
@@ -393,7 +394,7 @@ class App:
         self.cur = (0, 0)         # text cursor in the preview, (line, col) in the file
         self.kanchor = None       # where a Shift+arrow / mouse selection started
         self.goal = None          # column Up/Down try to keep
-        self.confirm = None       # key pressed once to discard unsaved edits
+        self.confirm = None       # action (key) waiting on the "save changes? y/n" answer
         self.init_colors()
         self.init_mouse()
         self.init_tty()
@@ -488,7 +489,7 @@ class App:
 
     def blocked(self):
         if self.unsaved():
-            self.status = "unsaved changes: Ctrl+S to save, or press Esc twice to discard"
+            self.status = "unsaved changes: Ctrl+S to save, or Esc to save or discard them"
             return True
         return False
 
@@ -1166,18 +1167,28 @@ class App:
                 self.status = ""
             if self.find_buf and not self.find_active():
                 self.find_buf = ""
-            discards = k in ("\x11", "\x14") or (k in ("\x1b", "\x03") and not self.selection_range())
-            if discards and self.unsaved():
-                if self.confirm != k:
-                    self.confirm = k
-                    name = {"\x1b": "Esc", "\x11": "Ctrl+Q", "\x14": "Ctrl+T", "\x03": "Ctrl+C"}[k]
-                    self.status = f"unsaved changes: Ctrl+S to save, or press {name} again to discard them"
+            if self.confirm is not None and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
+                action, self.confirm = self.confirm, None    # answer to "Save changes? y/n"
+                if k in ("y", "Y"):
+                    self.save()
+                    if self.unsaved():                       # save failed: status says why
+                        self.draw()
+                        continue
+                elif k in ("n", "N"):
+                    self.preview.file.dirty = False          # drop the edits
+                    self.refresh_preview()
+                else:
+                    self.status = "cancelled: still editing"
                     self.draw()
                     continue
-                self.preview.file.dirty = False          # confirmed: drop the edits
-                self.refresh_preview()
-            if k not in (None, curses.KEY_MOUSE):
-                self.confirm = None
+                k = action                                   # now carry out quit / leave / reload
+            discards = k in ("\x11", "\x14") or (k in ("\x1b", "\x03") and not self.selection_range())
+            if discards and self.unsaved():
+                self.confirm = k
+                name = os.path.basename(self.preview.path)
+                self.status = f"Save changes to {name}? y = yes, n = no, Esc = cancel"
+                self.draw()
+                continue
             if k is None:
                 pass
             elif k == curses.KEY_MOUSE:

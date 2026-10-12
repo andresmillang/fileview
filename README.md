@@ -12,7 +12,8 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - Text selection inside the preview only: drag with the mouse (auto-scrolls past the edges) or
   Ctrl+A for the whole file; Ctrl+C copies the exact file text, line endings and indentation included
 - Lightweight editing in the preview: text cursor, Shift+arrow selection, typing, Ctrl+V paste,
-  Ctrl+S save. Files are only written when you press Ctrl+S; leaving with unsaved changes warns first.
+  Ctrl+S save. Files are only written when you press Ctrl+S; leaving or quitting with unsaved changes asks
+  "Save changes? y/n" (Esc cancels).
   Editing is limited to UTF-8 text files up to 10 MB (others stay view-only so they can't be corrupted)
 - Adapts to terminal resizing
 
@@ -49,7 +50,7 @@ python3 fv.py [DIRECTORY]
 | Backspace / Delete | delete (a selection is deleted) |
 | Ctrl+V | paste from the system clipboard (your terminal's own paste, e.g. Ctrl+Shift+V, also works) |
 | Ctrl+S | save the file |
-| Esc | back to the file list (with unsaved changes it warns; press Esc again to discard them) |
+| Esc | back to the file list (with unsaved changes it asks: y = save, n = discard, Esc = cancel) |
 
 **Anywhere**
 
@@ -61,7 +62,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |
-| Ctrl+Q | quit (with unsaved changes it warns; press Ctrl+Q again to quit without saving) |
+| Ctrl+Q | quit (with unsaved changes it asks: y = save and quit, n = quit without saving, Esc = cancel) |
 
 Copying uses `wl-copy`, `xclip`, `xsel`, `pbcopy` or `clip.exe` when available, and also sends
 OSC 52 (up to 1 MB) so it works over SSH and in tmux, if the terminal allows clipboard writes.
