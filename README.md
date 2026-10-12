@@ -9,6 +9,7 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - Large files are read lazily — only the visible lines are loaded
 - Friendly messages for binary, empty, unreadable, and special files
 - Type-to-navigate: type the start of a name to jump to it, like a graphical file browser
+- `../` at the top of every folder to go up one level; Ctrl+N creates a new file
 - Text selection inside the preview only: drag with the mouse (auto-scrolls past the edges) or
   Ctrl+A for the whole file; Ctrl+C copies the exact file text, line endings and indentation included
 - Lightweight editing in the preview: text cursor, Shift+arrow selection, typing, Ctrl+V paste,
@@ -35,7 +36,7 @@ python3 fv.py [DIRECTORY]
 |---|---|
 | type letters | jump to the first name starting with them; keep typing to refine, repeat a letter to cycle (case-insensitive, resets after 1 s) |
 | ↑ ↓ PgUp PgDn Home End | move the selection; the preview follows |
-| Enter / → | open a directory, or move focus into the preview for a file |
+| Enter / → | open a directory (or `../` to go one folder up), or move focus into the preview for a file |
 | Backspace / ← | parent directory (Backspace deletes a typed letter while searching) |
 
 **Preview**
@@ -60,6 +61,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+A | select the whole previewed file |
 | Ctrl+C | copy the selection (quits if nothing is selected) |
 | Esc | clear the selection or cancel a typed name, and return to the file list |
+| Ctrl+N | create a new empty file in the current folder (asks for the name; Esc cancels) |
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |

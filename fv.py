@@ -22,6 +22,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Ctrl+A                       select the whole previewed file
     Ctrl+C                       copy the selection (quits if nothing is selected)
     Esc                          clear the selection / typed name; back to the file list
+    Ctrl+N                       create a new file in this folder
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
@@ -369,10 +370,9 @@ class Preview:
         except OSError as e:
             self.message = [f"Cannot read file: {e.strerror}"]
             return
-        if st.st_size == 0:
-            self.message = ["(empty file)"]
-            return
         self.kind = "text"
+        if st.st_size == 0:
+            self.info += " (empty)"
         sample = "\n".join(self.file.lines(0, 50))
         self.lexer = hl.lexer_for(path, sample)
         if self.lexer is not None:
@@ -430,6 +430,7 @@ class App:
         self.kanchor = None       # where a Shift+arrow / mouse selection started
         self.goal = None          # column Up/Down try to keep
         self.confirm = None       # action (key) waiting on the "save changes? y/n" answer
+        self.prompt = None        # footer text input: [label, text] (Ctrl+N file name)
         self.init_colors()
         self.init_mouse()
         self.init_tty()
@@ -501,9 +502,11 @@ class App:
         except OSError as e:
             self.entries = []
             self.error = f"Cannot open directory: {e.strerror}"
+        if os.path.dirname(self.cwd) != self.cwd:
+            self.entries.insert(0, ("..", True, False))   # "../" = go one folder up
         self.folded = [name.casefold() for name, _, _ in self.entries]
         self.find_buf = ""
-        self.sel = 0
+        self.sel = 1 if len(self.entries) > 1 and self.entries[0][0] == ".." else 0
         if focus:
             for i, (name, _, _) in enumerate(self.entries):
                 if name == focus:
@@ -545,6 +548,8 @@ class App:
         if not self.entries or self.blocked():
             return
         name, is_dir, _ = self.entries[self.sel]
+        if name == "..":
+            return self.parent()
         if not is_dir:
             self.set_focus("preview")
         if is_dir:
@@ -718,7 +723,7 @@ class App:
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         if self.focus == "list":
-            keys = "type to find  ↑↓ move  ⏎ open  ⌫ up  Tab preview  ^T hidden  ^Q quit "
+            keys = "type to find  ⏎ open  ⌫ up  Tab preview  ^N new  ^T hidden  ^Q quit "
         else:
             keys = "⇧ select  ^A all  ^C copy  ^V paste  ^Z undo  ^S save  Esc back  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
@@ -728,13 +733,22 @@ class App:
         start = w - len(keys)
         if start > len(left) + len(mid):
             self.put(h - 1, start, keys, len(keys) - 1, self.attr(10))
+        if self.prompt is not None:
+            self.put(h - 1, 0, (" " + "".join(self.prompt)).ljust(w), w, self.attr(10, curses.A_BOLD))
         self.place_cursor()
         self.scr.refresh()
 
     def place_cursor(self):
         show = False
         p, g = self.preview, self.pgeom
-        if self.focus == "preview" and p is not None and p.kind == "text" and g:
+        if self.prompt is not None:
+            h, w = self.scr.getmaxyx()
+            try:
+                self.scr.move(h - 1, min(w - 1, 1 + len("".join(self.prompt))))
+                show = True
+            except curses.error:
+                pass
+        elif self.focus == "preview" and p is not None and p.kind == "text" and g:
             y0, x0, ph, gw, cw = g
             l, c = self.cur
             if self.ptop <= l < self.ptop + ph and cw > 0:
@@ -1088,6 +1102,36 @@ class App:
         p.info = human(len(data)) + (f" · {p.lexer.name}" if p.lexer else "")
         self.status = f"saved {os.path.basename(p.path)} ({human(len(data))})"
 
+    def create_file(self, name):
+        name = name.strip()
+        if not name or "/" in name or name in (".", ".."):
+            self.status = f"not a valid file name: {name!r}"
+            return
+        try:
+            os.close(os.open(os.path.join(self.cwd, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+        except FileExistsError:
+            self.status = f"{name} already exists"
+            return
+        except OSError as e:
+            self.status = f"cannot create {name}: {e.strerror}"
+            return
+        self.load_dir(focus=name)
+        self.set_focus("preview")
+        self.status = f"created {name}"
+
+    def prompt_key(self, k):
+        """Keys while the footer asks for a file name."""
+        if k in ("\n", "\r", curses.KEY_ENTER):
+            name, self.prompt = self.prompt[1], None
+            self.create_file(name)
+        elif k == "\x1b":
+            self.prompt = None
+            self.status = "cancelled"
+        elif k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            self.prompt[1] = self.prompt[1][:-1]
+        elif isinstance(k, str) and k.isprintable():
+            self.prompt[1] += k
+
     def paste(self, ph):
         text = read_clipboard()
         if text is None:
@@ -1226,6 +1270,10 @@ class App:
                 self.status = ""
             if self.find_buf and not self.find_active():
                 self.find_buf = ""
+            if self.prompt is not None and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
+                self.prompt_key(k)
+                self.draw()
+                continue
             if self.confirm is not None and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
                 action, self.confirm = self.confirm, None    # answer to "Save changes? y/n"
                 if k in ("y", "Y"):
@@ -1241,7 +1289,7 @@ class App:
                     self.draw()
                     continue
                 k = action                                   # now carry out quit / leave / reload
-            discards = k in ("\x11", "\x14") or (k in ("\x1b", "\x03") and not self.selection_range())
+            discards = k in ("\x11", "\x14", "\x0e") or (k in ("\x1b", "\x03") and not self.selection_range())
             if discards and self.unsaved():
                 self.confirm = k
                 name = os.path.basename(self.preview.path)
@@ -1256,6 +1304,8 @@ class App:
                 break
             elif k == "\x13":                 # Ctrl+S
                 self.save()
+            elif k == "\x0e":                 # Ctrl+N: new file in this folder
+                self.prompt = ["New file name: ", ""]
             elif self.focus == "preview" and self.preview_key(k, ph):
                 pass
             elif k == "\t":
