@@ -3,7 +3,7 @@
 A read-only terminal file explorer with a live preview pane. Move the selection
 and the right pane immediately shows the highlighted file's contents.
 
-![fv screenshot](docs/screenshot.svg)
+![fv: live preview with a mouse selection in progress](docs/screenshot.svg)
 
 - Pure stdlib (`curses`); [Pygments](https://pygments.org) optional for syntax highlighting
 - Large files are read lazily — only the visible lines are loaded
