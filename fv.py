@@ -11,20 +11,30 @@ Keys
   j/k  J/K  space/b  g/G         scroll preview: line, 10 lines, page, top/bottom
   .                              toggle hidden files
   Ctrl-L                         redraw the screen
+  mouse drag in preview          select text (auto-scrolls at the edges), copies on release
+  y / Esc                        copy selection again / clear selection
+  mouse wheel                    scroll the panel under the pointer
   q / Q                          quit
 """
 import array
+import base64
 import curses
 import locale
 import os
+import shutil
 import stat
+import subprocess
 import sys
+import time
 
 CHUNK = 64 * 1024
 SNIFF = 8192
 MAX_LINE = 4096          # bytes of a single line we ever render
 HL_CONTEXT = 200         # lines of context fed to the lexer above the viewport
 TAB = 4
+EOL = 1 << 60            # selection column meaning "past the end of the line" (includes newline)
+AUTOSCROLL_S = 0.04      # auto-scroll tick while dragging at/beyond the preview edge
+OSC52_MAX = 1 << 20      # largest selection (bytes) also sent to the terminal clipboard
 
 
 # ---------------------------------------------------------------- file access
@@ -79,6 +89,16 @@ class LazyFile:
             raw = self.f.read(min(end - begin, MAX_LINE))
             out.append(raw.rstrip(b"\r\n").decode("utf-8", "replace"))
         return out
+
+    def raw_line(self, i):
+        """Full line i (no MAX_LINE cap) as (text, original line ending)."""
+        self._index_until(i + 1)
+        begin = self.offsets[i]
+        end = self.offsets[i + 1] if i + 1 < len(self.offsets) else self.size
+        self.f.seek(begin)
+        raw = self.f.read(end - begin).decode("utf-8", "replace")
+        text = raw.rstrip("\r\n")
+        return text, raw[len(text):]
 
     def index_all(self):
         self._index_until(sys.maxsize)
@@ -263,7 +283,16 @@ class App:
         self.preview = None
         self.hl = Highlighter()
         self.error = ""
+        self.status = ""          # transient footer message (e.g. "copied ...")
+        self.sel_anchor = None    # selection endpoints as (line, char col) in the FILE
+        self.sel_cursor = None
+        self.dragging = False
+        self.drag_yx = (0, 0)
+        self.last_autoscroll = 0.0
+        self.autoscroll_ticks = 0
+        self.pgeom = None         # last drawn text-preview geometry (y0, x0, ph, gw, cw)
         self.init_colors()
+        self.init_mouse()
         self.load_dir()
 
     def init_colors(self):
@@ -283,6 +312,17 @@ class App:
                 curses.init_pair(i, fg, bg)
             curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selection
             curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_WHITE)  # bars
+
+    def init_mouse(self):
+        try:
+            curses.mouseinterval(0)   # deliver press/release immediately, no click synthesis
+            avail, _ = curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except curses.error:
+            avail = 0
+        self.mouse = bool(avail)
+        if self.mouse:
+            # ncurses only enables mode 1000 (clicks); 1002 adds motion while a button is held
+            term_write("\x1b[?1002h")
 
     def attr(self, pair, extra=0):
         if not self.has_color or pair == 0:
@@ -316,6 +356,7 @@ class App:
         if self.preview:
             self.preview.close()
         self.ptop = 0
+        self.clear_selection()
         if self.entries:
             self.preview = Preview(os.path.join(self.cwd, self.entries[self.sel][0]), self.hl)
         else:
@@ -436,6 +477,11 @@ class App:
         left = f" {self.sel + 1 if self.entries else 0}/{len(self.entries)}"
         if self.error and self.entries:
             left += f"  {self.error}"
+        rng = self.selection_range()
+        if self.status:
+            left += f"  {self.status}"
+        elif rng:
+            left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         keys = "↑↓ move  ⏎ open  ⌫ up  j/k J/K spc/b g/G scroll  . hidden  q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
@@ -467,6 +513,9 @@ class App:
         lines = p.file.lines(self.ptop, ph)
         gw = len(str(self.ptop + ph)) + 1
         cw = pw - gw - 1
+        self.pgeom = (y0, x0, ph, gw, cw)
+        rng = self.selection_range()
+        sel_attr = self.attr(9) if self.has_color else curses.A_REVERSE
         rendered = None
         if p.lexer is not None and lines:
             ctx = max(0, self.ptop - HL_CONTEXT)
@@ -492,16 +541,185 @@ class App:
                     break
                 self.put(y, x + col, text, room, self.attr(pair))
                 col += len(text)
+            if rng:
+                self.paint_selection(y, x, cw, self.ptop + i, line, rng, sel_attr)
+
+    # ---- mouse selection (application-managed, in file coordinates)
+
+    def clear_selection(self):
+        self.sel_anchor = self.sel_cursor = None
+        self.dragging = False
+
+    def selection_range(self):
+        """((line, col), (line, col)) inclusive, ordered; None if nothing selected."""
+        if self.sel_anchor is None or self.sel_cursor is None:
+            return None
+        a, b = sorted((self.sel_anchor, self.sel_cursor))
+        return a, b
+
+    def in_preview(self, y, x):
+        g = self.pgeom
+        return g is not None and g[0] <= y < g[0] + g[2] and x >= g[1]
+
+    def file_pos(self, y, x):
+        """Map a screen cell (clamped into the preview) to a (line, char col) in the file."""
+        y0, x0, ph, gw, cw = self.pgeom
+        p = self.preview
+        row = max(0, min(ph - 1, y - y0))
+        line_no = self.ptop + row
+        lines = p.file.lines(line_no, 1)
+        if not lines:                        # pointer below the last line of the file
+            line_no = max(0, p.file.count() - 1)
+            return line_no, EOL
+        text = lines[0]
+        if y < y0:
+            dcol = 0                         # above the panel: start of the top line
+        elif y >= y0 + ph:
+            return line_no, EOL              # below the panel: end of the bottom line
+        else:
+            dcol = x - (x0 + gw)
+        if dcol < 0:
+            return line_no, 0
+        cols = display_cols(text)
+        if dcol >= cw - 1 and cols[-1] > cw:  # right edge of a clipped line: take all of it
+            return line_no, EOL
+        for i in range(len(text)):
+            if cols[i + 1] > dcol:
+                return line_no, i
+        return line_no, EOL
+
+    def paint_selection(self, y, x, cw, line_no, text, rng, attr):
+        (l0, c0), (l1, c1) = rng
+        if not (l0 <= line_no <= l1):
+            return
+        cols = display_cols(text)
+        start = c0 if line_no == l0 else 0
+        end = c1 if line_no == l1 else EOL   # inclusive char index
+        d0 = cols[min(start, len(text))]
+        d1 = cols[min(end + 1, len(text))] + (1 if end >= len(text) else 0)  # +1 cell for newline
+        d0, d1 = min(d0, cw), min(d1, cw)
+        if d1 > d0:
+            try:
+                self.scr.chgat(y, x + d0, d1 - d0, attr)
+            except curses.error:
+                pass
+
+    def selection_text(self):
+        rng = self.selection_range()
+        if not rng or self.preview is None or self.preview.kind != "text":
+            return ""
+        (l0, c0), (l1, c1) = rng
+        f = self.preview.file
+        out = []
+        for n in range(l0, l1 + 1):
+            text, ending = f.raw_line(n)
+            start = c0 if n == l0 else 0
+            end = c1 if n == l1 else EOL
+            out.append(text[start:end + 1])
+            if end >= len(text):
+                out.append(ending)
+        return "".join(out)
+
+    def copy_selection(self):
+        text = self.selection_text()
+        if not text:
+            return
+        rng = self.selection_range()
+        nlines = rng[1][0] - rng[0][0] + 1
+        how = copy_to_clipboard(text)
+        self.status = f"copied {nlines} line{'s' * (nlines != 1)} ({human(len(text.encode()))}) → {how}"
+
+    def handle_mouse(self):
+        try:
+            _, x, y, _, bstate = curses.getmouse()
+        except curses.error:
+            return
+        p = self.preview
+        text_preview = p is not None and p.kind == "text"
+        if bstate & curses.BUTTON1_PRESSED:
+            if text_preview and self.in_preview(y, x):
+                self.status = ""
+                self.dragging = True
+                self.drag_yx = (y, x)
+                self.autoscroll_ticks = 0
+                self.sel_anchor = self.sel_cursor = self.file_pos(y, x)
+                self.press_pos = self.sel_anchor
+                self.moved = False
+            elif x < self.layout()[2] - 1 and 1 <= y < self.layout()[0] - 1:
+                idx = self.top + y - 1
+                if idx < len(self.entries):
+                    self.move(idx - self.sel)
+        elif bstate & curses.BUTTON1_RELEASED:
+            if self.dragging:
+                self.dragging = False
+                self.drag_yx = (y, x)
+                self.sel_cursor = self.file_pos(y, x)
+                if not self.moved and self.sel_cursor == self.press_pos:
+                    self.clear_selection()   # plain click: no selection
+                else:
+                    self.copy_selection()
+        elif bstate & curses.REPORT_MOUSE_POSITION:
+            if self.dragging:
+                self.drag_yx = (y, x)
+                self.moved = True
+                self.sel_cursor = self.file_pos(y, x)
+        elif bstate & (curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0)):
+            step = -3 if bstate & curses.BUTTON4_PRESSED else 3
+            h, _, lw = self.layout()
+            if x >= lw:
+                self.scroll_preview(step, max(1, h - 2))
+            else:
+                self.move(step)
+
+    def autoscroll(self):
+        """While dragging with the pointer at/beyond the top or bottom edge, scroll + extend."""
+        if not self.dragging or self.pgeom is None:
+            return
+        now = time.monotonic()
+        if now - self.last_autoscroll < AUTOSCROLL_S:
+            return
+        y0, _, ph, _, _ = self.pgeom
+        y, x = self.drag_yx
+        if y < y0:
+            direction, speed = -1, 3          # beyond the top edge (header row)
+        elif y == y0:
+            direction, speed = -1, 1
+        elif y >= y0 + ph:
+            direction, speed = 1, 3           # beyond the bottom edge (footer row)
+        elif y == y0 + ph - 1:
+            direction, speed = 1, 1
+        else:
+            self.autoscroll_ticks = 0
+            return
+        self.last_autoscroll = now
+        self.autoscroll_ticks += 1
+        if speed > 1:                         # accelerate the longer it is held beyond the edge
+            speed = min(60, speed + self.autoscroll_ticks // 6)
+        before = self.ptop
+        self.scroll_preview(direction * speed, ph)
+        if self.ptop != before:
+            self.moved = True
+        self.sel_cursor = self.file_pos(y, x)
 
     # ---- main loop
 
     def run(self):
         self.draw()
         while True:
-            k = self.scr.get_wch()
+            self.scr.timeout(int(AUTOSCROLL_S * 1000) if self.dragging else -1)
+            try:
+                k = self.scr.get_wch()
+            except curses.error:
+                k = None                      # timeout tick while dragging
             h, _, _ = self.layout()
             ph = max(1, h - 2)
-            if k in ("q", "Q"):
+            if k not in (None, curses.KEY_MOUSE):
+                self.status = ""
+            if k is None:
+                pass
+            elif k == curses.KEY_MOUSE:
+                self.handle_mouse()
+            elif k in ("q", "Q"):
                 break
             elif k == curses.KEY_UP:
                 self.move(-1)
@@ -543,9 +761,59 @@ class App:
                 curses.update_lines_cols()
             elif k == "\x0c":             # Ctrl-L: full repaint
                 self.scr.clear()
+            elif k == "y":
+                self.copy_selection()
+            elif k == "\x1b":
+                self.clear_selection()
+            self.autoscroll()
             self.draw()
         if self.preview:
             self.preview.close()
+
+
+def display_cols(text):
+    """cols[i] = display column where char i starts (same tab rule as sanitize); cols[-1] = width."""
+    cols = [0]
+    c = 0
+    for ch in text:
+        c += TAB - (c % TAB) if ch == "\t" else 1
+        cols.append(c)
+    return cols
+
+
+def term_write(seq):
+    try:
+        os.write(sys.stdout.fileno(), seq.encode() if isinstance(seq, str) else seq)
+    except OSError:
+        pass
+
+
+def copy_to_clipboard(text):
+    """Copy via a system clipboard tool if present, and via OSC 52 (works over SSH/tmux)."""
+    data = text.encode("utf-8")
+    tools = []
+    if os.environ.get("WAYLAND_DISPLAY"):
+        tools.append(["wl-copy"])
+    if os.environ.get("DISPLAY"):
+        tools += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+    tools += [["pbcopy"], ["clip.exe"]]
+    used = []
+    for cmd in tools:
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=data, timeout=2, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                used.append(cmd[0])
+                break
+            except (OSError, subprocess.SubprocessError):
+                continue
+    if len(data) <= OSC52_MAX:
+        osc = b"\x1b]52;c;" + base64.b64encode(data) + b"\x07"
+        if os.environ.get("TMUX"):
+            osc = b"\x1bPtmux;\x1b" + osc + b"\x1b\\"
+        term_write(osc)
+        used.append("OSC 52")
+    return " + ".join(used) if used else "no clipboard available"
 
 
 def sanitize(text, col):
@@ -581,6 +849,8 @@ def main():
         curses.wrapper(lambda scr: App(scr, start).run())
     except KeyboardInterrupt:
         pass
+    finally:
+        term_write("\x1b[?1002l\x1b[?1006l\x1b[?1000l")
 
 
 if __name__ == "__main__":
