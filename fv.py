@@ -36,6 +36,9 @@ TAB = 4
 EOL = 1 << 60            # selection column meaning "past the end of the line" (includes newline)
 AUTOSCROLL_S = 0.04      # auto-scroll tick while dragging at/beyond the preview edge
 OSC52_MAX = 1 << 20      # largest selection (bytes) also sent to the terminal clipboard
+# keys that scroll the preview when it has focus
+PREVIEW_SCROLL = {curses.KEY_UP: "up", curses.KEY_DOWN: "down", curses.KEY_PPAGE: "pgup",
+                  curses.KEY_NPAGE: "pgdn", curses.KEY_HOME: "home", curses.KEY_END: "end"}
 
 
 # ---------------------------------------------------------------- file access
@@ -281,6 +284,7 @@ class App:
         self.sel = 0
         self.top = 0
         self.ptop = 0             # preview scroll
+        self.focus = "list"       # "list" | "preview": which panel the keys act on
         self.preview = None
         self.hl = Highlighter()
         self.error = ""
@@ -350,6 +354,7 @@ class App:
     # ---- state changes
 
     def load_dir(self, focus=None):
+        self.focus = "list"
         try:
             self.entries = sorted_entries(self.cwd, self.show_hidden)
             self.error = ""
@@ -387,6 +392,8 @@ class App:
         if not self.entries:
             return
         name, is_dir, _ = self.entries[self.sel]
+        if not is_dir:
+            self.set_focus("preview")
         if is_dir:
             target = os.path.join(self.cwd, name)
             if not os.access(target, os.R_OK | os.X_OK):
@@ -394,6 +401,11 @@ class App:
                 return
             self.cwd = os.path.normpath(target)
             self.load_dir()
+
+    def set_focus(self, panel):
+        if panel == "preview" and self.layout()[2] >= self.layout()[1]:
+            return                    # too narrow: preview isn't shown
+        self.focus = panel
 
     def parent(self):
         parent = os.path.dirname(self.cwd)
@@ -466,7 +478,10 @@ class App:
             name, is_dir, is_link = self.entries[i]
             label = name + ("/" if is_dir else "") + ("@" if is_link and not is_dir else "")
             if i == self.sel:
-                a = self.attr(9, curses.A_BOLD) if self.has_color else curses.A_REVERSE
+                if self.focus == "list":
+                    a = self.attr(9, curses.A_BOLD) if self.has_color else curses.A_REVERSE
+                else:
+                    a = self.attr(10) if self.has_color else curses.A_UNDERLINE
                 self.put(1 + row, 0, (" " + label).ljust(lw - 1), lw - 1, a)
             else:
                 a = self.attr(4) if is_dir else 0
@@ -474,9 +489,10 @@ class App:
 
         # divider + right pane
         if lw < w:
+            div = self.attr(9, curses.A_BOLD) if self.focus == "preview" else 0
             for y in range(1, h - 1):
                 try:
-                    self.scr.addch(y, lw - 1, curses.ACS_VLINE)
+                    self.scr.addch(y, lw - 1, curses.ACS_VLINE, div)
                 except curses.error:
                     pass
             self.draw_preview(1, lw + 1, body, w - lw - 1)
@@ -495,7 +511,10 @@ class App:
             left += f"  {self.status}"
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
-        keys = "↑↓ move  ⏎ open  ⌫ up  j/k J/K spc/b g/G scroll  ^T hidden  ^Q quit "
+        if self.focus == "list":
+            keys = "↑↓ move  ⏎ open  ⌫ up  Tab preview  ^T hidden  ^Q quit "
+        else:
+            keys = "↑↓ PgUp/PgDn Home/End scroll  ← Tab files  ^C copy  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
         mid = f"  {info}  "
@@ -650,6 +669,7 @@ class App:
         p = self.preview
         text_preview = p is not None and p.kind == "text"
         if bstate & curses.BUTTON1_PRESSED:
+            self.set_focus("preview" if x >= self.layout()[2] else "list")
             if text_preview and self.in_preview(y, x):
                 self.status = ""
                 self.dragging = True
@@ -734,6 +754,17 @@ class App:
                 self.handle_mouse()
             elif k == "\x11":                 # Ctrl+Q
                 break
+            elif k == "\t":
+                self.set_focus("preview" if self.focus == "list" else "list")
+            elif self.focus == "preview" and k in PREVIEW_SCROLL:
+                action = PREVIEW_SCROLL[k]
+                if action == "home":
+                    self.ptop = 0
+                else:
+                    step = {"up": -1, "down": 1, "pgup": -ph, "pgdn": ph, "end": "end"}[action]
+                    self.scroll_preview(step, ph)
+            elif self.focus == "preview" and k == curses.KEY_LEFT:
+                self.set_focus("list")
             elif k == curses.KEY_UP:
                 self.move(-1)
             elif k == curses.KEY_DOWN:
@@ -747,25 +778,10 @@ class App:
             elif k == curses.KEY_END:
                 self.move(len(self.entries))
             elif k in ("\n", "\r", curses.KEY_ENTER, curses.KEY_RIGHT):
-                self.enter()
+                if self.focus == "list":
+                    self.enter()
             elif k in (curses.KEY_BACKSPACE, "\x7f", "\b", curses.KEY_LEFT):
                 self.parent()
-            elif k == "j":
-                self.scroll_preview(1, ph)
-            elif k == "k":
-                self.scroll_preview(-1, ph)
-            elif k == "J":
-                self.scroll_preview(10, ph)
-            elif k == "K":
-                self.scroll_preview(-10, ph)
-            elif k == " ":
-                self.scroll_preview(ph, ph)
-            elif k == "b":
-                self.scroll_preview(-ph, ph)
-            elif k == "g":
-                self.ptop = 0
-            elif k == "G":
-                self.scroll_preview("end", ph)
             elif k == "\x14":                 # Ctrl+T: toggle hidden files
                 self.show_hidden = not self.show_hidden
                 cur = self.entries[self.sel][0] if self.entries else None
@@ -777,8 +793,6 @@ class App:
             elif k == "\x03":
                 if not self.selection_range():
                     break                     # nothing selected: Ctrl-C quits as before
-                self.copy_selection()
-            elif k == "y":
                 self.copy_selection()
             elif k == "\x1b":
                 self.clear_selection()
