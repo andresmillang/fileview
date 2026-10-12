@@ -65,6 +65,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+C | copy the selection (quits if nothing is selected) |
 | Esc | clear the selection, marks or a typed name, and return to the file list |
 | Ctrl+N | create a new empty file in the current folder (asks for the name; Esc cancels) |
+| F2 | rename the highlighted file or folder (pre-filled; Ctrl+U clears; never overwrites an existing name) |
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |

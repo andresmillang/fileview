@@ -26,6 +26,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Ctrl+C                       copy the selection (quits if nothing is selected)
     Esc                          clear the selection / typed name; back to the file list
     Ctrl+N                       create a new file in this folder
+    F2                           rename the highlighted file or folder (Ctrl+U clears the name)
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
@@ -434,7 +435,7 @@ class App:
         self.kanchor = None       # where a Shift+arrow / mouse selection started
         self.goal = None          # column Up/Down try to keep
         self.confirm = None       # action (key) waiting on the "save changes? y/n" answer
-        self.prompt = None        # footer text input: [label, text] (Ctrl+N file name)
+        self.prompt = None        # footer text input: [label, text, on_enter] (Ctrl+N, F2)
         self.marked = set()       # names marked in the file list (Space / Shift+arrows / Ctrl+click)
         self.pending_delete = None  # names waiting on the "Delete …? y/n" answer
         self.init_colors()
@@ -751,7 +752,7 @@ class App:
         if start > len(left) + len(mid):
             self.put(h - 1, start, keys, len(keys) - 1, self.attr(10))
         if self.prompt is not None or self.confirm is not None or self.pending_delete:  # a question
-            ask = "".join(self.prompt) if self.prompt is not None else self.status
+            ask = self.prompt[0] + self.prompt[1] if self.prompt is not None else self.status
             loud = curses.color_pair(11) if self.has_color else curses.A_REVERSE | curses.A_BOLD
             self.put(h - 1, 0, (" " + ask).ljust(w), w, loud)
         self.place_cursor()
@@ -763,7 +764,7 @@ class App:
         if self.prompt is not None:
             h, w = self.scr.getmaxyx()
             try:
-                self.scr.move(h - 1, min(w - 1, 1 + len("".join(self.prompt))))
+                self.scr.move(h - 1, min(w - 1, 1 + len(self.prompt[0] + self.prompt[1])))
                 show = True
             except curses.error:
                 pass
@@ -1166,6 +1167,35 @@ class App:
             self.refresh_preview()
         self.status = f"deleted {done}" + (f"; not deleted: {'; '.join(failed)}" if failed else "")
 
+    def ask_rename(self):
+        if not self.entries or self.entries[self.sel][0] == "..":
+            self.status = "nothing to rename"
+        elif not self.blocked():
+            old = self.entries[self.sel][0]
+            self.prompt = [f"Rename {old} to: ", old, lambda new: self.rename(old, new)]
+
+    def rename(self, old, new):
+        new = new.strip()
+        if new == old:
+            self.status = "name unchanged"
+            return
+        if not new or "/" in new or new in (".", ".."):
+            self.status = f"not a valid name: {new!r}"
+            return
+        target = os.path.join(self.cwd, new)
+        src = os.path.join(self.cwd, old)
+        same = new.casefold() == old.casefold() and os.path.lexists(target) and os.path.samefile(src, target)
+        if os.path.lexists(target) and not same:   # os.rename would silently replace it
+            self.status = f"{new} already exists"
+            return
+        try:
+            os.rename(src, target)
+        except OSError as e:
+            self.status = f"cannot rename {old}: {e.strerror}"
+            return
+        self.load_dir(focus=new)
+        self.status = f"renamed {old} → {new}"
+
     def create_file(self, name):
         name = name.strip()
         if not name or "/" in name or name in (".", ".."):
@@ -1186,13 +1216,15 @@ class App:
     def prompt_key(self, k):
         """Keys while the footer asks for a file name."""
         if k in ("\n", "\r", curses.KEY_ENTER):
-            name, self.prompt = self.prompt[1], None
-            self.create_file(name)
+            (_, name, on_enter), self.prompt = self.prompt, None
+            on_enter(name)
         elif k == "\x1b":
             self.prompt = None
             self.status = "cancelled"
         elif k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
             self.prompt[1] = self.prompt[1][:-1]
+        elif k == "\x15":                     # Ctrl+U: clear the text
+            self.prompt[1] = ""
         elif isinstance(k, str) and k.isprintable():
             self.prompt[1] += k
 
@@ -1379,7 +1411,9 @@ class App:
             elif k == "\x13":                 # Ctrl+S
                 self.save()
             elif k == "\x0e":                 # Ctrl+N: new file in this folder
-                self.prompt = ["New file name: ", ""]
+                self.prompt = ["New file name: ", "", self.create_file]
+            elif k == curses.KEY_F2:              # F2: rename the highlighted entry
+                self.ask_rename()
             elif self.focus == "preview" and self.preview_key(k, ph):
                 pass
             elif k == "\t":
