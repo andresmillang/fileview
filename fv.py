@@ -10,6 +10,7 @@ Keys
   Backspace / Left               go to parent directory
   j/k  J/K  space/b  g/G         scroll preview: line, 10 lines, page, top/bottom
   .                              toggle hidden files
+  Ctrl-L                         redraw the screen
   q / Q                          quit
 """
 import array
@@ -540,6 +541,8 @@ class App:
                 self.load_dir(focus=cur)
             elif k == curses.KEY_RESIZE:
                 curses.update_lines_cols()
+            elif k == "\x0c":             # Ctrl-L: full repaint
+                self.scr.clear()
             self.draw()
         if self.preview:
             self.preview.close()

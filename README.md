@@ -3,6 +3,8 @@
 A read-only terminal file explorer with a live preview pane. Move the selection
 and the right pane immediately shows the highlighted file's contents.
 
+![fv screenshot](docs/screenshot.svg)
+
 - Pure stdlib (`curses`); [Pygments](https://pygments.org) optional for syntax highlighting
 - Large files are read lazily — only the visible lines are loaded
 - Friendly messages for binary, empty, unreadable, and special files
@@ -25,4 +27,5 @@ python3 fv.py [DIRECTORY]
 | Backspace / ← | parent directory |
 | `j`/`k` `J`/`K` space/`b` `g`/`G` | scroll preview: line / 10 lines / page / top-bottom |
 | `.` | toggle hidden files |
+| Ctrl-L | redraw the screen |
 | `q` / `Q` | quit |
