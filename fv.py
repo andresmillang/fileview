@@ -36,6 +36,7 @@ TAB = 4
 EOL = 1 << 60            # selection column meaning "past the end of the line" (includes newline)
 AUTOSCROLL_S = 0.04      # auto-scroll tick while dragging at/beyond the preview edge
 OSC52_MAX = 1 << 20      # largest selection (bytes) also sent to the terminal clipboard
+TYPEAHEAD_S = 1.0        # type-to-navigate buffer resets after this much inactivity
 # keys that scroll the preview when it has focus
 PREVIEW_SCROLL = {curses.KEY_UP: "up", curses.KEY_DOWN: "down", curses.KEY_PPAGE: "pgup",
                   curses.KEY_NPAGE: "pgdn", curses.KEY_HOME: "home", curses.KEY_END: "end"}
@@ -285,6 +286,9 @@ class App:
         self.top = 0
         self.ptop = 0             # preview scroll
         self.focus = "list"       # "list" | "preview": which panel the keys act on
+        self.find_buf = ""        # type-to-navigate prefix (casefolded)
+        self.find_time = 0.0
+        self.folded = []          # casefolded entry names, parallel to self.entries
         self.preview = None
         self.hl = Highlighter()
         self.error = ""
@@ -361,6 +365,8 @@ class App:
         except OSError as e:
             self.entries = []
             self.error = f"Cannot open directory: {e.strerror}"
+        self.folded = [name.casefold() for name, _, _ in self.entries]
+        self.find_buf = ""
         self.sel = 0
         if focus:
             for i, (name, _, _) in enumerate(self.entries):
@@ -401,6 +407,50 @@ class App:
                 return
             self.cwd = os.path.normpath(target)
             self.load_dir()
+
+    # ---- type-to-navigate (list focus)
+
+    def find_active(self):
+        return bool(self.find_buf) and time.monotonic() - self.find_time <= TYPEAHEAD_S
+
+    def find_from(self, prefix, start):
+        """Index of the first entry at/after start (wrapping) whose name starts with prefix."""
+        n = len(self.folded)
+        for i in range(n):
+            j = (start + i) % n
+            if self.folded[j].startswith(prefix):
+                return j
+        return None
+
+    def type_ahead(self, ch):
+        if not self.entries:
+            return
+        if not self.find_active():
+            self.find_buf = ""
+        self.find_time = time.monotonic()
+        c = ch.casefold()
+        new = self.find_buf + c
+        if len(new) == 1:
+            # fresh letter: jump to the first match, or cycle on if already on one
+            start = self.sel + 1 if self.folded[self.sel].startswith(c) else 0
+            idx = self.find_from(c, start)
+        else:
+            idx = self.find_from(new, self.sel)            # refine, staying put if still matching
+            if idx is None and new == c * len(new):
+                idx = self.find_from(c, self.sel + 1)       # same letter repeated: cycle
+        if idx is None:
+            self.status = f"no match: {new}"
+            return
+        self.find_buf = new
+        self.move(idx - self.sel)
+
+    def find_backspace(self):
+        self.find_buf = self.find_buf[:-1]
+        self.find_time = time.monotonic()
+        if self.find_buf:
+            idx = self.find_from(self.find_buf, 0)
+            if idx is not None:
+                self.move(idx - self.sel)
 
     def set_focus(self, panel):
         if panel == "preview" and self.layout()[2] >= self.layout()[1]:
@@ -507,12 +557,14 @@ class App:
         if self.error and self.entries:
             left += f"  {self.error}"
         rng = self.selection_range()
+        if self.find_active():
+            left += f"  find: {self.find_buf}"
         if self.status:
             left += f"  {self.status}"
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         if self.focus == "list":
-            keys = "↑↓ move  ⏎ open  ⌫ up  Tab preview  ^T hidden  ^Q quit "
+            keys = "type to find  ↑↓ move  ⏎ open  ⌫ up  Tab preview  ^T hidden  ^Q quit "
         else:
             keys = "↑↓ PgUp/PgDn Home/End scroll  ← Tab files  ^C copy  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
@@ -737,7 +789,13 @@ class App:
     def run(self):
         self.draw()
         while True:
-            self.scr.timeout(int(AUTOSCROLL_S * 1000) if self.dragging else -1)
+            if self.dragging:
+                self.scr.timeout(int(AUTOSCROLL_S * 1000))
+            elif self.find_buf:               # wake up to clear the find prompt when it expires
+                left = TYPEAHEAD_S - (time.monotonic() - self.find_time)
+                self.scr.timeout(max(10, int(left * 1000) + 10))
+            else:
+                self.scr.timeout(-1)
             try:
                 k = self.scr.get_wch()
             except curses.error:
@@ -748,6 +806,8 @@ class App:
             ph = max(1, h - 2)
             if k not in (None, curses.KEY_MOUSE):
                 self.status = ""
+            if self.find_buf and not self.find_active():
+                self.find_buf = ""
             if k is None:
                 pass
             elif k == curses.KEY_MOUSE:
@@ -756,6 +816,14 @@ class App:
                 break
             elif k == "\t":
                 self.set_focus("preview" if self.focus == "list" else "list")
+            elif (self.focus == "list" and isinstance(k, str) and k.isprintable()
+                  and (k != " " or self.find_buf)):
+                self.type_ahead(k)
+            elif self.focus == "list" and self.find_buf and k in (
+                    curses.KEY_BACKSPACE, "\x7f", "\b"):
+                self.find_backspace()
+            elif self.find_buf and k == "\x1b":
+                self.find_buf = ""
             elif self.focus == "preview" and k in PREVIEW_SCROLL:
                 action = PREVIEW_SCROLL[k]
                 if action == "home":
