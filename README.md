@@ -3,7 +3,7 @@
 A terminal file explorer with a live preview pane. Move the selection and the right
 pane immediately shows the highlighted file's contents — and you can edit and save it.
 
-![fv: live preview with a mouse selection in progress](docs/screenshot.svg)
+![fv: two marked entries and a text selection in the live preview](docs/screenshot.svg)
 
 - Pure stdlib (`curses`); [Pygments](https://pygments.org) optional for syntax highlighting
 - Large files are read lazily — only the visible lines are loaded
