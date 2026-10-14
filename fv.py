@@ -29,6 +29,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     F2                           rename the highlighted file or folder (Ctrl+U clears the name)
     Ctrl+C / Ctrl+V (file list)  copy the marked (or highlighted) entries / paste them into this folder;
                                  existing names are kept — copies get "(copy)" added
+    Ctrl+X (file list)           cut: the next Ctrl+V moves the entries into that folder
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
@@ -440,7 +441,8 @@ class App:
         self.prompt = None        # footer text input: [label, text, on_enter] (Ctrl+N, F2)
         self.marked = set()       # names marked in the file list (Space / Shift+arrows / Ctrl+click)
         self.pending_delete = None  # names waiting on the "Delete …? y/n" answer
-        self.file_clip = []       # absolute paths copied with Ctrl+C in the file list
+        self.file_clip = []       # absolute paths copied with Ctrl+C (or cut with Ctrl+X) in the file list
+        self.clip_cut = False     # True: the next paste moves file_clip instead of copying it
         self.init_colors()
         self.init_mouse()
         self.init_tty()
@@ -744,7 +746,7 @@ class App:
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         if self.focus == "list":
-            keys = "Spc mark  ^C copy  ^V paste  Del delete  F2 rename  ^N new  ^Q quit "
+            keys = "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  F2 rename  ^N new  ^Q quit "
         else:
             keys = "⇧ select  ^A all  ^C copy  ^V paste  ^Z undo  ^S save  Esc back  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
@@ -1171,40 +1173,57 @@ class App:
             self.refresh_preview()
         self.status = f"deleted {done}" + (f"; not deleted: {'; '.join(failed)}" if failed else "")
 
-    def copy_files(self):
+    def copy_files(self, cut=False):
         names = sorted(self.marked) if self.marked else (
             [self.entries[self.sel][0]] if self.entries and self.entries[self.sel][0] != ".." else [])
         if not names:
-            self.status = "nothing to copy"
+            self.status = "nothing to cut" if cut else "nothing to copy"
             return
         self.file_clip = [os.path.join(self.cwd, n) for n in names]
+        self.clip_cut = cut
         what = names[0] if len(names) == 1 else f"{len(names)} items"
-        self.status = f"copied {what} — Ctrl+V in a folder to paste"
+        self.status = f"{'cut' if cut else 'copied'} {what} — Ctrl+V in a folder to {'move it' if cut else 'paste'}"
 
     def paste_files(self):
         if not self.file_clip:
-            self.status = "nothing to paste: copy files with Ctrl+C first"
+            self.status = "nothing to paste: copy files with Ctrl+C or cut them with Ctrl+X first"
             return
-        done, failed, first = 0, [], None
+        if self.clip_cut and self.blocked():
+            return
+        done, failed, first, left = 0, [], None, []
         for src in self.file_clip:
             name = os.path.basename(src)
+            if self.clip_cut and os.path.realpath(os.path.dirname(src)) == os.path.realpath(self.cwd):
+                failed.append(f"{name}: already in this folder")
+                left.append(src)
+                continue
             dest = os.path.join(self.cwd, unique_name(self.cwd, name))
             try:
                 if os.path.isdir(src) and not os.path.islink(src):
                     real = os.path.realpath(src)
                     if os.path.realpath(self.cwd) == real or os.path.realpath(self.cwd).startswith(real + os.sep):
-                        failed.append(f"{name}: can't paste a folder into itself")
+                        failed.append(f"{name}: can't {'move' if self.clip_cut else 'paste'} a folder into itself")
+                        left.append(src)
                         continue
-                    shutil.copytree(src, dest, symlinks=True)
+                    if self.clip_cut:
+                        shutil.move(src, dest)
+                    else:
+                        shutil.copytree(src, dest, symlinks=True)
+                elif self.clip_cut:
+                    shutil.move(src, dest)
                 else:
                     shutil.copy2(src, dest, follow_symlinks=False)
                 done += 1
                 first = first or os.path.basename(dest)
             except (OSError, shutil.Error) as e:
                 failed.append(f"{name}: {getattr(e, 'strerror', None) or e}")
+                left.append(src)
+        verb = "moved" if self.clip_cut else "pasted"
+        if self.clip_cut:
+            self.file_clip = left      # moved entries no longer exist where they were cut
         self.load_dir(focus=first)
-        self.status = f"pasted {done}" + (f" ({first}{', …' if done > 1 else ''})" if done else "") + (
-            f"; not pasted: {'; '.join(failed)}" if failed else "")
+        self.status = f"{verb} {done}" + (f" ({first}{', …' if done > 1 else ''})" if done else "") + (
+            f"; not {verb}: {'; '.join(failed)}" if failed else "")
 
     def ask_rename(self):
         if not self.entries or self.entries[self.sel][0] == "..":
@@ -1454,6 +1473,8 @@ class App:
                 self.prompt = ["New file name: ", "", self.create_file]
             elif self.focus == "list" and k == "\x03":    # Ctrl+C in the list: copy files
                 self.copy_files()
+            elif self.focus == "list" and k == "\x18":    # Ctrl+X in the list: cut files (Ctrl+V moves them)
+                self.copy_files(cut=True)
             elif self.focus == "list" and k == "\x16":    # Ctrl+V in the list: paste files here
                 self.paste_files()
             elif k == curses.KEY_F2:              # F2: rename the highlighted entry

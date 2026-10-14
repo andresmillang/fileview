@@ -10,7 +10,7 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - Friendly messages for binary, empty, unreadable, and special files
 - Type-to-navigate: type the start of a name to jump to it, like a graphical file browser
 - `../` at the top of every folder to go up one level; Ctrl+N creates a new file
-- Mark several files with Space; copy/paste them with Ctrl+C/Ctrl+V, delete them with Del (always asks first;
+- Mark several files with Space; copy/paste them with Ctrl+C/Ctrl+V, move them with Ctrl+X/Ctrl+V, delete them with Del (always asks first;
   non-empty folders are never deleted), rename with F2
 - Text selection inside the preview only: drag with the mouse (auto-scrolls past the edges) or
   Ctrl+A for the whole file; Ctrl+C copies the exact file text, line endings and indentation included
@@ -68,6 +68,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+N | create a new empty file in the current folder (asks for the name; Esc cancels) |
 | F2 | rename the highlighted file or folder (pre-filled; Ctrl+U clears; never overwrites an existing name) |
 | Ctrl+C / Ctrl+V | copy the marked (or highlighted) files and folders / paste them into the current folder; an existing name is never overwritten — the copy becomes `name (copy).ext` |
+| Ctrl+X | cut the marked (or highlighted) files and folders; the next Ctrl+V moves them into the current folder (never overwrites either) |
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |
