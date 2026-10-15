@@ -9,7 +9,8 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - Large files are read lazily — only the visible lines are loaded
 - Friendly messages for binary, empty, unreadable, and special files
 - Type-to-navigate: type the start of a name to jump to it, like a graphical file browser
-- `../` at the top of every folder to go up one level; Ctrl+N creates a new file
+- `../` at the top of every folder to go up one level; Ctrl+N creates a new file, F7 a new folder
+- Find text in the previewed file with Ctrl+F (F3 / Shift+F3 for the next / previous match)
 - Mark several files with Space; copy/paste them with Ctrl+C/Ctrl+V, move them with Ctrl+X/Ctrl+V, delete them with Del (always asks first;
   non-empty folders are never deleted), rename with F2
 - Text selection inside the preview only: drag with the mouse (auto-scrolls past the edges) or
@@ -56,6 +57,8 @@ python3 fv.py [DIRECTORY]
 | Ctrl+V | paste from the system clipboard (your terminal's own paste, e.g. Ctrl+Shift+V, also works) |
 | Ctrl+Z | undo (a run of typing is undone in one step; undoing back to the last save clears `[modified]`) |
 | Ctrl+S | save the file |
+| Ctrl+F | find text in the file (case-insensitive, wraps around); the match is selected. Pre-filled with the last search; Ctrl+U clears it |
+| F3 / Shift+F3 | next / previous match |
 | Esc | back to the file list (with unsaved changes it asks: y = save, n = discard, Esc = cancel) |
 
 **Anywhere**
@@ -66,6 +69,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+C | in the preview: copy the selected text (quits if nothing is selected); in the file list: copy files |
 | Esc | clear the selection, marks or a typed name, and return to the file list |
 | Ctrl+N | create a new empty file in the current folder (asks for the name; Esc cancels) |
+| F7 | create a new folder in the current folder (asks for the name; Esc cancels) |
 | F2 | rename the highlighted file or folder (pre-filled; Ctrl+U clears; never overwrites an existing name) |
 | Ctrl+C / Ctrl+V | copy the marked (or highlighted) files and folders / paste them into the current folder |
 | Ctrl+X | cut the marked (or highlighted) files and folders; the next Ctrl+V moves them into the current folder |

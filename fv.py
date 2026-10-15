@@ -20,12 +20,14 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     type, Enter, Tab             insert text      Backspace / Delete   delete
     Ctrl+V                       paste            Ctrl+S               save
     Ctrl+Z                       undo (typing is undone a run at a time)
+    Ctrl+F                       find text (case-insensitive); F3 / Shift+F3 = next / previous match
     Esc                          back to the file list (asks to save if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
     Ctrl+C                       copy the selected text (in the preview; quits if nothing is selected)
     Esc                          clear the selection / typed name; back to the file list
     Ctrl+N                       create a new file in this folder
+    F7                           create a new folder in this folder
     F2                           rename the highlighted file or folder (Ctrl+U clears the name)
     Ctrl+C / Ctrl+V (file list)  copy the marked (or highlighted) entries / paste them into this folder;
     Ctrl+X (file list)           cut: the next Ctrl+V moves the entries into that folder
@@ -42,6 +44,7 @@ import curses
 import errno
 import locale
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -437,6 +440,7 @@ class App:
         self.pgeom = None         # last drawn text-preview geometry (y0, x0, ph, gw, cw)
         self.cur = (0, 0)         # text cursor in the preview, (line, col) in the file
         self.kanchor = None       # where a Shift+arrow / mouse selection started
+        self.last_find = ""       # Ctrl+F text, reused by F3 / Shift+F3
         self.goal = None          # column Up/Down try to keep
         self.confirm = None       # action (key) waiting on the "save changes? y/n" answer
         self.prompt = None        # footer text input: [label, text, on_enter] (Ctrl+N, F2)
@@ -748,13 +752,17 @@ class App:
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         if self.focus == "list":
-            keys = "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  F2 rename  ^N new  ^Q quit "
+            keys = "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  F2 rename  ^N new  F7 folder  ^Q quit "
         else:
-            keys = "⇧ select  ^A all  ^C copy  ^V paste  ^Z undo  ^S save  Esc back  ^Q quit "
+            keys = "⇧ select  ^A all  ^F find  ^C copy  ^V paste  ^Z undo  ^S save  Esc back  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
         mid = f"  {info}  "
         self.put(h - 1, len(left), mid, max(0, w - len(left)), self.attr(10, curses.A_BOLD))
+        hints = keys.split("  ")              # too narrow: drop hints right to left, keeping "^Q quit"
+        while len(hints) > 1 and w - len(keys) <= len(left) + len(mid):
+            del hints[-2]
+            keys = "  ".join(hints)
         start = w - len(keys)
         if start > len(left) + len(mid):
             self.put(h - 1, start, keys, len(keys) - 1, self.attr(10))
@@ -1315,6 +1323,56 @@ class App:
         self.set_focus("preview")
         self.status = f"created {name}"
 
+    def create_folder(self, name):
+        name = name.strip()
+        if not name or "/" in name or name in (".", ".."):
+            self.status = f"not a valid folder name: {name!r}"
+            return
+        try:
+            os.mkdir(os.path.join(self.cwd, name))
+        except FileExistsError:
+            self.status = f"{name} already exists"
+            return
+        except OSError as e:
+            self.status = f"cannot create {name}: {e.strerror}"
+            return
+        self.load_dir(focus=name)
+        self.status = f"created folder {name}"
+
+    def find(self, text, back=False):
+        """Select the next (or previous) case-insensitive match of text in the preview, wrapping around."""
+        p = self.preview
+        if p is None or p.kind != "text":
+            self.status = "nothing to search: open a text file"
+            return
+        if not text:
+            self.status = "type something to find (Ctrl+F)"
+            return
+        self.last_find = text
+        pat = re.compile(re.escape(text), re.IGNORECASE)
+        f, rng = p.file, self.selection_range()
+        start = rng[0] if back and rng else self.cur
+        f.index_all()                             # need the line count to wrap around
+        n = f.count()
+        for step in range(n + 1):
+            l = (start[0] - step if back else start[0] + step) % n
+            line = f.raw_line(l)[0]
+            hits = list(pat.finditer(line))
+            if step == 0:                        # the cursor's own line: only past (or before) the cursor
+                                                 # (step n revisits it after wrapping, all matches allowed)
+                hits = [m for m in hits if (m.start() < start[1] if back else m.start() >= start[1])]
+            if hits:
+                m = hits[-1] if back else hits[0]
+                wrapped = step == n or (l > start[0] if back else l < start[0])
+                h, _, _ = self.layout()
+                ph = max(1, h - 2)
+                self.set_focus("preview")
+                self.set_cursor((l, m.start()), ph)
+                self.set_cursor((l, m.end()), ph, extend=True)
+                self.status = f"found {text!r} at line {l + 1}" + (" (wrapped around)" if wrapped else "")
+                return
+        self.status = f"{text!r} not found"
+
     def prompt_key(self, k):
         """Keys while the footer asks for a file name."""
         if k in ("\n", "\r", curses.KEY_ENTER):
@@ -1508,7 +1566,7 @@ class App:
                     self.draw()
                     continue
                 k = action                                   # now carry out quit / leave / reload
-            discards = k in ("\x11", "\x14", "\x0e") or (
+            discards = k in ("\x11", "\x14", "\x0e", curses.KEY_F7) or (
                 k in ("\x1b", "\x03") and not self.selection_range() and not (k == "\x03" and self.focus == "list"))
             if discards and self.unsaved():
                 self.confirm = k
@@ -1532,6 +1590,12 @@ class App:
                 self.copy_files(cut=True)
             elif self.focus == "list" and k == "\x16":    # Ctrl+V in the list: paste files here
                 self.paste_files()
+            elif k == "\x06":                 # Ctrl+F: find text in the preview
+                self.prompt = ["Find: ", self.last_find, self.find]
+            elif k == curses.KEY_F3 or (isinstance(k, int) and curses.keyname(k) == b"KEY_F(15)"):
+                self.find(self.last_find, back=k != curses.KEY_F3)    # F3 next, Shift+F3 previous
+            elif k == curses.KEY_F7:              # F7: new folder here
+                self.prompt = ["New folder name: ", "", self.create_folder]
             elif k == curses.KEY_F2:              # F2: rename the highlighted entry
                 self.ask_rename()
             elif self.focus == "preview" and self.preview_key(k, ph):
