@@ -21,6 +21,8 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Ctrl+V                       paste            Ctrl+S               save
     Ctrl+Z                       undo (typing is undone a run at a time)
     Ctrl+F                       find text (case-insensitive); F3 / Shift+F3 = next / previous match
+    Ctrl+R                       run the highlighted .py file with python3; its output replaces the
+                                 preview (Ctrl+R again while it runs: stop it)
     Esc                          back to the file list (asks to save if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
@@ -40,12 +42,14 @@ Keys (Tab or a mouse click picks the panel the keys act on)
 """
 import array
 import base64
+import codecs
 import curses
 import errno
 import locale
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -64,6 +68,7 @@ TYPEAHEAD_S = 1.0        # type-to-navigate buffer resets after this much inacti
 EOF_LINE = 1 << 60       # selection line meaning "end of file" (Ctrl+A), never indexed
 COPY_MAX = 100 << 20     # refuse to copy selections larger than this
 EDIT_MAX = 10 << 20      # files up to this size (UTF-8 text) can be edited
+OUTPUT_MAX = 10 << 20    # keep at most this much output of a program run with Ctrl+R
 # keys that scroll the preview when it has focus
 PREVIEW_SCROLL = {curses.KEY_UP: "up", curses.KEY_DOWN: "down", curses.KEY_PPAGE: "pgup",
                   curses.KEY_NPAGE: "pgdn", curses.KEY_HOME: "home", curses.KEY_END: "end"}
@@ -345,8 +350,57 @@ class Highlighter:
 
 # ---------------------------------------------------------------- preview model
 
+class OutputText:
+    """Output of a program run with Ctrl+R, growing as it arrives; same read API as EditBuffer."""
+
+    def __init__(self):
+        self.text = [""]
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.size = 0
+        self.eof = True
+
+    def feed(self, data):
+        self.size += len(data)
+        parts = self.decoder.decode(data).replace("\r\n", "\n").split("\n")
+        self.text[-1] += parts[0]
+        self.text.extend(parts[1:])
+
+    def close(self):
+        pass
+
+    def _index_until(self, n):
+        pass
+
+    def index_all(self):
+        pass
+
+    def count(self):
+        return len(self.text) - (1 if len(self.text) > 1 and self.text[-1] == "" else 0)
+
+    def lines(self, start, n):
+        return [t[:MAX_LINE] for t in self.text[start:min(start + n, self.count())]]
+
+    def raw_line(self, i):
+        return self.text[i], "\n" if i < len(self.text) - 1 else ""
+
+    def span_size(self, l0, l1):
+        return sum(len((t + e).encode()) for t, e in map(self.raw_line, range(l0, l1 + 1)))
+
+    def read_all(self):
+        return "\n".join(self.text).encode("utf-8")
+
+
 class Preview:
     """What the right pane shows for one path."""
+
+    output = False             # True: showing what the program printed (Ctrl+R), not the file
+
+    @classmethod
+    def program_output(cls, path):
+        p = cls.__new__(cls)
+        p.path, p.kind, p.message, p.entries, p.lexer = path, "text", [], [], None
+        p.file, p.output, p.info = OutputText(), True, f"running {os.path.basename(path)}"
+        return p
 
     def __init__(self, path, hl):
         self.path = path
@@ -441,6 +495,7 @@ class App:
         self.cur = (0, 0)         # text cursor in the preview, (line, col) in the file
         self.kanchor = None       # where a Shift+arrow / mouse selection started
         self.last_find = ""       # Ctrl+F text, reused by F3 / Shift+F3
+        self.proc = None          # Python program started with Ctrl+R, while it runs
         self.goal = None          # column Up/Down try to keep
         self.confirm = None       # action (key) waiting on the "save changes? y/n" answer
         self.prompt = None        # footer text input: [label, text, on_enter] (Ctrl+N, F2)
@@ -541,6 +596,7 @@ class App:
         self.refresh_preview()
 
     def refresh_preview(self):
+        self.stop_program()
         if self.preview:
             self.preview.close()
         self.ptop = 0
@@ -751,10 +807,11 @@ class App:
             left += f"  sel all ({f.count()} lines)" if f.eof else f"  sel all ({human(f.size)})"
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
+        run = "^R stop  " if self.proc else "^R run  " if self.preview and self.preview.path.endswith(".py") else ""
         if self.focus == "list":
-            keys = "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  F2 rename  ^N new  F7 folder  ^Q quit "
+            keys = run + "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  F2 rename  ^N new  F7 folder  ^Q quit "
         else:
-            keys = "⇧ select  ^A all  ^F find  ^C copy  ^V paste  ^Z undo  ^S save  Esc back  ^Q quit "
+            keys = run + "^S save  ⇧ select  ^A all  ^F find  ^C copy  ^V paste  ^Z undo  Esc back  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
         mid = f"  {info}  "
@@ -1046,6 +1103,9 @@ class App:
             return None
         if isinstance(p.file, EditBuffer):
             return p.file
+        if p.output:
+            self.status = "this is the program's output (read-only); Ctrl+R runs it again"
+            return None
         if p.file.size > EDIT_MAX:
             self.status = f"too large to edit ({human(p.file.size)}, limit {human(EDIT_MAX)})"
         elif not os.access(p.path, os.W_OK):
@@ -1373,6 +1433,78 @@ class App:
                 return
         self.status = f"{text!r} not found"
 
+    def run_program(self):
+        """Ctrl+R: run the highlighted .py file; its output replaces the preview. Again: stop it."""
+        if self.proc:
+            self.stop_program()
+            self.status = "stopped"
+            return
+        if not self.entries:
+            return
+        path = os.path.join(self.cwd, self.entries[self.sel][0])
+        if not (path.endswith(".py") and os.path.isfile(path)):
+            self.status = "Ctrl+R runs Python files (.py)"
+            return
+        python = shutil.which("python3") or shutil.which("python") or sys.executable
+        try:
+            proc = subprocess.Popen([python, "-u", path], cwd=self.cwd, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    start_new_session=True)    # its own group: stop kills its children too
+        except OSError as e:
+            self.status = f"cannot run {python}: {e.strerror}"
+            return
+        self.refresh_preview()
+        self.preview.close()
+        self.preview = Preview.program_output(path)
+        self.preview.file.feed(f"$ {os.path.basename(python)} {os.path.basename(path)}\n".encode())
+        os.set_blocking(proc.stdout.fileno(), False)
+        self.proc, self.proc_start, self.proc_kept = proc, time.monotonic(), 0
+        self.set_focus("preview")
+
+    def stop_program(self):
+        if self.proc:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            self.poll_program(stopped=True)
+
+    def poll_program(self, stopped=False):
+        """Show whatever the running program printed; finish up once it has exited."""
+        p, proc = self.preview, self.proc
+        out = p.file
+        h, _, _ = self.layout()
+        ph = max(1, h - 2)
+        follow = self.ptop + ph >= out.count()      # end of output visible: keep showing the end
+        while True:
+            try:
+                data = proc.stdout.read(CHUNK)
+            except (BlockingIOError, OSError, ValueError):
+                data = None
+            if not data:
+                break
+            room = OUTPUT_MAX - self.proc_kept
+            if room > 0:
+                out.feed(data[:room])
+            self.proc_kept += len(data)
+        if follow:
+            self.ptop = max(0, out.count() - ph)
+        if data is None and not stopped:
+            return                                   # nothing more yet, still running
+        if proc.poll() is None and not stopped:
+            return                                   # output closed but it hasn't exited yet
+        code = proc.wait()
+        proc.stdout.close()
+        self.proc = None
+        secs = time.monotonic() - self.proc_start
+        if self.proc_kept > OUTPUT_MAX:
+            out.feed(f"\n[output cut at {human(OUTPUT_MAX)}]".encode())
+        end = "stopped" if stopped else f"exit code {code}"
+        out.feed(f"{'' if out.text[-1] == '' else chr(10)}[{end} · {secs:.1f} s]\n".encode())
+        p.info = f"output of {os.path.basename(p.path)} · {end}"
+        if follow:
+            self.ptop = max(0, out.count() - ph)
+
     def prompt_key(self, k):
         """Keys while the footer asks for a file name."""
         if k in ("\n", "\r", curses.KEY_ENTER):
@@ -1511,6 +1643,8 @@ class App:
         while True:
             if self.dragging:
                 self.scr.timeout(int(AUTOSCROLL_S * 1000))
+            elif self.proc:                   # a program is running: pick up its output
+                self.scr.timeout(100)
             elif self.find_buf:               # wake up to clear the find prompt when it expires
                 left = TYPEAHEAD_S - (time.monotonic() - self.find_time)
                 self.scr.timeout(max(10, int(left * 1000) + 10))
@@ -1522,6 +1656,8 @@ class App:
                 k = None                      # timeout tick while dragging
             except KeyboardInterrupt:
                 k = "\x03"                    # Ctrl-C: copy if something is selected
+            if self.proc:
+                self.poll_program()
             h, _, _ = self.layout()
             ph = max(1, h - 2)
             if k not in (None, curses.KEY_MOUSE):
@@ -1566,7 +1702,7 @@ class App:
                     self.draw()
                     continue
                 k = action                                   # now carry out quit / leave / reload
-            discards = k in ("\x11", "\x14", "\x0e", curses.KEY_F7) or (
+            discards = k in ("\x11", "\x14", "\x0e", "\x12", curses.KEY_F7) or (
                 k in ("\x1b", "\x03") and not self.selection_range() and not (k == "\x03" and self.focus == "list"))
             if discards and self.unsaved():
                 self.confirm = k
@@ -1590,6 +1726,8 @@ class App:
                 self.copy_files(cut=True)
             elif self.focus == "list" and k == "\x16":    # Ctrl+V in the list: paste files here
                 self.paste_files()
+            elif k == "\x12":                 # Ctrl+R: run the .py file (again: stop it)
+                self.run_program()
             elif k == "\x06":                 # Ctrl+F: find text in the preview
                 self.prompt = ["Find: ", self.last_find, self.find]
             elif k == curses.KEY_F3 or (isinstance(k, int) and curses.keyname(k) == b"KEY_F(15)"):
@@ -1656,6 +1794,7 @@ class App:
                     self.set_focus("list")        # back to the file list to pick another file
             self.autoscroll()
             self.draw()
+        self.stop_program()
         if self.preview:
             self.preview.close()
 

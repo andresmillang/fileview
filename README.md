@@ -11,6 +11,7 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - Type-to-navigate: type the start of a name to jump to it, like a graphical file browser
 - `../` at the top of every folder to go up one level; Ctrl+N creates a new file, F7 a new folder
 - Find text in the previewed file with Ctrl+F (F3 / Shift+F3 for the next / previous match)
+- Run a Python file with Ctrl+R: its output streams into the right panel
 - Mark several files with Space; copy/paste them with Ctrl+C/Ctrl+V, move them with Ctrl+X/Ctrl+V, delete them with Del (always asks first;
   non-empty folders are never deleted), rename with F2
 - Text selection inside the preview only: drag with the mouse (auto-scrolls past the edges) or
@@ -69,6 +70,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+C | in the preview: copy the selected text (quits if nothing is selected); in the file list: copy files |
 | Esc | clear the selection, marks or a typed name, and return to the file list |
 | Ctrl+N | create a new empty file in the current folder (asks for the name; Esc cancels) |
+| Ctrl+R | run the highlighted `.py` file with `python3` (in its folder); the output, errors included, appears live in the right panel with the exit code at the end. Ctrl+R again while it runs stops it (child processes too); moving to another file or quitting also stops it. The program gets no keyboard input (`input()` raises EOFError) |
 | F7 | create a new folder in the current folder (asks for the name; Esc cancels) |
 | F2 | rename the highlighted file or folder (pre-filled; Ctrl+U clears; never overwrites an existing name) |
 | Ctrl+C / Ctrl+V | copy the marked (or highlighted) files and folders / paste them into the current folder |
