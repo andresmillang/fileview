@@ -22,9 +22,11 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Ctrl+Z                       undo (typing is undone a run at a time)
     Ctrl+F                       find text (case-insensitive); F3 or Ctrl+G = next match,
                                  Shift+F3 = previous match
-    Ctrl+R                       run the highlighted .py (python3) or .sh (bash) file; its output
-                                 replaces the preview (Ctrl+R again while it runs: stop it;
-                                 Esc: back to the file's contents)
+    Ctrl+R                       run the highlighted file: .py (python3, or uv run for scripts with
+                                 inline dependencies / inside a pyproject project), .sh (bash),
+                                 .js (node), .pl (perl), any script starting with #!, or an
+                                 executable file (shown in green). The output replaces the preview
+                                 (Ctrl+R again while it runs: stop it; Esc: back to the file)
     Esc                          back to the file list (asks to save if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
@@ -72,6 +74,8 @@ EOF_LINE = 1 << 60       # selection line meaning "end of file" (Ctrl+A), never 
 COPY_MAX = 100 << 20     # refuse to copy selections larger than this
 EDIT_MAX = 10 << 20      # files up to this size (UTF-8 text) can be edited
 OUTPUT_MAX = 10 << 20    # keep at most this much output of a program run with Ctrl+R
+RUN_EXT = {".py": None, ".sh": ("bash", "sh"), ".js": ("node",), ".mjs": ("node",), ".cjs": ("node",),
+           ".pl": ("perl",)}  # Ctrl+R runs these with the first interpreter found (.py: see run_command)
 # keys that scroll the preview when it has focus
 PREVIEW_SCROLL = {curses.KEY_UP: "up", curses.KEY_DOWN: "down", curses.KEY_PPAGE: "pgup",
                   curses.KEY_NPAGE: "pgdn", curses.KEY_HOME: "home", curses.KEY_END: "end"}
@@ -537,6 +541,13 @@ class App:
             for i, fg in enumerate(pairs, start=1):
                 curses.init_pair(i, fg, bg)
             curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selection
+            # file list: folders bright blue, runnable files bright green (fixed 256-colour shades,
+            # since the theme's own dark blue is hard to read on a dark background)
+            hi = curses.COLORS >= 256
+            curses.init_pair(12, 75 if hi else curses.COLOR_BLUE, bg)
+            curses.init_pair(13, 77 if hi else curses.COLOR_GREEN, bg)
+            if hi:
+                curses.init_pair(9, 16, 51)                                # selection: black on bright cyan
             curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_WHITE)  # bars
             # questions to the user: pure black on bright yellow (palette 16/226 when available —
             # themes don't remap those); no bold, which many terminals turn into grey text
@@ -577,7 +588,7 @@ class App:
         if not self.has_color or pair == 0:
             return extra
         a = curses.color_pair(pair) | extra
-        if pair == 4:
+        if pair in (4, 12, 13):
             a |= curses.A_BOLD
         if pair == 6:
             a |= curses.A_DIM
@@ -783,7 +794,8 @@ class App:
                     a = self.attr(10) if self.has_color else curses.A_UNDERLINE
                 self.put(1 + row, 0, (" " + label).ljust(lw - 1), lw - 1, a)
             else:
-                a = self.attr(5, curses.A_BOLD) if name in self.marked else (self.attr(4) if is_dir else 0)
+                a = (self.attr(5, curses.A_BOLD) if name in self.marked else self.attr(12) if is_dir
+                     else self.attr(13) if runnable(os.path.join(self.cwd, name), check_shebang=False) else 0)
                 self.put(1 + row, 1, label, lw - 2, a)
 
         # divider + right pane
@@ -819,7 +831,7 @@ class App:
             left += f"  sel all ({f.count()} lines)" if f.eof else f"  sel all ({human(f.size)})"
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
-        run = "^R stop  " if self.proc else "^R run  " if self.preview and self.preview.path.endswith((".py", ".sh")) else ""
+        run = "^R stop  " if self.proc else "^R run  " if self.preview and runnable(self.preview.path) else ""
         if self.focus == "list":
             keys = run + "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  ^E rename  ^N new  ^D folder  ^H help  ^Q quit "
         else:
@@ -880,7 +892,7 @@ class App:
         if p.kind == "dir":
             for i, (name, is_dir, _) in enumerate(p.entries[self.ptop:self.ptop + ph]):
                 self.put(y0 + i, x0, name + ("/" if is_dir else ""), pw,
-                         self.attr(4) if is_dir else 0)
+                         self.attr(12) if is_dir else 0)
             if not p.entries:
                 self.put(y0, x0, "(empty directory)", pw, self.attr(6))
             return
@@ -1460,7 +1472,7 @@ class App:
         self.set_focus("preview")
 
     def run_program(self):
-        """Ctrl+R: run the highlighted .py / .sh file; its output replaces the preview. Again: stop it."""
+        """Ctrl+R: run the highlighted script or program; its output replaces the preview. Again: stop it."""
         if self.proc:
             self.stop_program()
             self.status = "stopped"
@@ -1468,26 +1480,26 @@ class App:
         if not self.entries:
             return
         path = os.path.join(self.cwd, self.entries[self.sel][0])
-        if not (path.endswith((".py", ".sh")) and os.path.isfile(path)):
-            self.status = "Ctrl+R runs Python (.py) and shell (.sh) files"
+        if not os.path.isfile(path):
+            self.status = "Ctrl+R runs .py .sh .js .pl files, scripts starting with #! and executable files"
             return
-        if path.endswith(".sh"):
-            prog = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
-            cmd = [prog, path]
-        else:
-            prog = shutil.which("python3") or shutil.which("python") or sys.executable
-            cmd = [prog, "-u", path]
+        cmd = run_command(path)
+        if isinstance(cmd, str):
+            self.status = cmd
+            return
         try:
             proc = subprocess.Popen(cmd, cwd=self.cwd, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    env=run_env(cmd),
                                     start_new_session=True)    # its own group: stop kills its children too
         except OSError as e:
-            self.status = f"cannot run {prog}: {e.strerror}"
+            self.status = f"cannot run {os.path.basename(cmd[0])}: {e.strerror}"
             return
         self.refresh_preview()
         self.preview.close()
         self.preview = Preview.program_output(path)
-        self.preview.file.feed(f"$ {os.path.basename(prog)} {os.path.basename(path)}\n".encode())
+        shown = [os.path.basename(a) if a in (cmd[0], path) else a for a in cmd]
+        self.preview.file.feed(f"$ {' '.join(shown)}\n".encode())
         os.set_blocking(proc.stdout.fileno(), False)
         self.proc, self.proc_start, self.proc_kept = proc, time.monotonic(), 0
         self.set_focus("preview")
@@ -1920,6 +1932,69 @@ def remove_entry(path):
         shutil.rmtree(path)
     else:
         os.remove(path)
+
+
+def runnable(path, check_shebang=True):
+    """Can Ctrl+R run this file? (known extension, executable bit, or a #! first line)"""
+    if not os.path.isfile(path):
+        return False
+    if os.path.splitext(path)[1] in RUN_EXT or os.access(path, os.X_OK):
+        return True
+    if not check_shebang:
+        return False
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def run_command(path):
+    """The command line Ctrl+R uses for path, or a string saying why it can't run."""
+    ext = os.path.splitext(path)[1]
+    if ext == ".py":
+        uv = shutil.which("uv")
+        try:
+            with open(path, "rb") as f:
+                head = f.read(SNIFF)
+        except OSError as e:
+            return f"cannot read it: {e.strerror}"
+        if uv and re.search(rb"(?m)^# /// script\s*$", head):     # inline dependencies (PEP 723)
+            return [uv, "run", "--script", path]
+        d = os.path.dirname(path)
+        while uv:                                   # inside a uv / pyproject project: use its environment
+            if os.path.isfile(os.path.join(d, "pyproject.toml")):
+                return [uv, "run", "python", "-u", path]
+            if os.path.dirname(d) == d:
+                break
+            d = os.path.dirname(d)
+        return [shutil.which("python3") or shutil.which("python") or sys.executable, "-u", path]
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(512)
+    except OSError as e:
+        return f"cannot read it: {e.strerror}"
+    if first.startswith(b"#!"):                     # the script names its interpreter, like the kernel does
+        parts = first[2:].decode("utf-8", "replace").strip().split(None, 1)
+        if parts:
+            return parts + [path]
+    if ext in RUN_EXT:
+        for name in RUN_EXT[ext]:
+            if shutil.which(name):
+                return [shutil.which(name), path]
+        return f"{RUN_EXT[ext][0]} is not installed"
+    if os.access(path, os.X_OK):
+        if sniff_binary(path):
+            return [path]                           # a compiled program
+        return [shutil.which("sh") or "/bin/sh", path]
+    return "Ctrl+R runs .py .sh .js .pl files, scripts starting with #! and executable files"
+
+
+def run_env(cmd):
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    if os.path.basename(cmd[0]) == "uv":
+        env.pop("VIRTUAL_ENV", None)     # uv run uses the project's own environment; skip its mismatch warning
+    return env
 
 
 def read_clipboard():

@@ -11,7 +11,8 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - Type-to-navigate: type the start of a name to jump to it, like a graphical file browser
 - `../` at the top of every folder to go up one level; Ctrl+N creates a new file, Ctrl+D (or F7) a new folder
 - Find text in the previewed file with Ctrl+F (F3 or Ctrl+G / Shift+F3 for the next / previous match)
-- Run a Python or shell file with Ctrl+R: its output streams into the right panel (Esc shows the file again)
+- Run scripts and programs with Ctrl+R (Python, shell, Node, Perl, anything with a `#!` line, executables): the output streams into the right panel (Esc shows the file again)
+- Folders in bright blue, runnable files in bright green
 - Mark several files with Space; copy/paste them with Ctrl+C/Ctrl+V, move them with Ctrl+X/Ctrl+V, delete them with Del (always asks first;
   non-empty folders are never deleted), rename with Ctrl+E (or F2)
 - Text selection inside the preview only: drag with the mouse (auto-scrolls past the edges) or
@@ -71,7 +72,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+C | in the preview: copy the selected text (quits if nothing is selected); in the file list: copy files |
 | Esc | clear the selection, marks or a typed name, and return to the file list |
 | Ctrl+N | create a new empty file in the current folder (asks for the name; Esc cancels) |
-| Ctrl+R | run the highlighted `.py` file with `python3`, or `.sh` file with `bash` (in its folder); the output, errors included, appears live in the right panel with the exit code at the end. Ctrl+R again while it runs stops it (child processes too); Esc switches back to the file's contents (stopping it if it is still running); moving to another file or quitting also stops it. The program gets no keyboard input (`input()` raises EOFError) |
+| Ctrl+R | run the highlighted file in its folder: `.py` with `python3` — or `uv run` when the script declares inline dependencies (`# /// script`) or sits in a `pyproject.toml` project — `.sh` with `bash`, `.js`/`.mjs`/`.cjs` with `node`, `.pl` with `perl`, any file whose first line is `#!…` with that interpreter, and executable files directly. The output, errors included, appears live in the right panel with the exit code at the end. Ctrl+R again while it runs stops it (child processes too); Esc switches back to the file's contents (stopping it if it is still running); moving to another file or quitting also stops it. The program gets no keyboard input |
 | Ctrl+D / F7 | create a new folder in the current folder (asks for the name; Esc cancels). On many laptops a bare F7 is a hardware key (e.g. display switch) — use Ctrl+D or Fn+F7 |
 | Ctrl+E / F2 | rename the highlighted file or folder (pre-filled; Ctrl+U clears; never overwrites an existing name) |
 | Ctrl+C / Ctrl+V | copy the marked (or highlighted) files and folders / paste them into the current folder |
