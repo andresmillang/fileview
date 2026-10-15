@@ -29,7 +29,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Ctrl+C                       copy the selected text (in the preview; quits if nothing is selected)
     Esc                          clear the selection / typed name; back to the file list
     Ctrl+N                       create a new file in this folder
-    F7                           create a new folder in this folder
+    Ctrl+D / F7                  create a new folder in this folder
     F2                           rename the highlighted file or folder (Ctrl+U clears the name)
     Ctrl+C / Ctrl+V (file list)  copy the marked (or highlighted) entries / paste them into this folder;
     Ctrl+X (file list)           cut: the next Ctrl+V moves the entries into that folder
@@ -809,7 +809,7 @@ class App:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         run = "^R stop  " if self.proc else "^R run  " if self.preview and self.preview.path.endswith(".py") else ""
         if self.focus == "list":
-            keys = run + "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  F2 rename  ^N new  F7 folder  ^Q quit "
+            keys = run + "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  F2 rename  ^N new  ^D folder  ^Q quit "
         else:
             keys = run + "^S save  ⇧ select  ^A all  ^F find  ^C copy  ^V paste  ^Z undo  Esc back  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
@@ -1702,7 +1702,7 @@ class App:
                     self.draw()
                     continue
                 k = action                                   # now carry out quit / leave / reload
-            discards = k in ("\x11", "\x14", "\x0e", "\x12", curses.KEY_F7) or (
+            discards = k in ("\x11", "\x14", "\x0e", "\x12", "\x04", curses.KEY_F7) or (
                 k in ("\x1b", "\x03") and not self.selection_range() and not (k == "\x03" and self.focus == "list"))
             if discards and self.unsaved():
                 self.confirm = k
@@ -1732,7 +1732,7 @@ class App:
                 self.prompt = ["Find: ", self.last_find, self.find]
             elif k == curses.KEY_F3 or (isinstance(k, int) and curses.keyname(k) == b"KEY_F(15)"):
                 self.find(self.last_find, back=k != curses.KEY_F3)    # F3 next, Shift+F3 previous
-            elif k == curses.KEY_F7:              # F7: new folder here
+            elif k in (curses.KEY_F7, "\x04"):   # F7 / Ctrl+D: new folder here (laptops often eat bare F7)
                 self.prompt = ["New folder name: ", "", self.create_folder]
             elif k == curses.KEY_F2:              # F2: rename the highlighted entry
                 self.ask_rename()
