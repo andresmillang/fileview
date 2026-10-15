@@ -20,7 +20,8 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     type, Enter, Tab             insert text      Backspace / Delete   delete
     Ctrl+V                       paste            Ctrl+S               save
     Ctrl+Z                       undo (typing is undone a run at a time)
-    Ctrl+F                       find text (case-insensitive); F3 / Shift+F3 = next / previous match
+    Ctrl+F                       find text (case-insensitive); F3 or Ctrl+G = next match,
+                                 Shift+F3 = previous match
     Ctrl+R                       run the highlighted .py file with python3; its output replaces the
                                  preview (Ctrl+R again while it runs: stop it)
     Esc                          back to the file list (asks to save if there are unsaved changes)
@@ -30,11 +31,12 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Esc                          clear the selection / typed name; back to the file list
     Ctrl+N                       create a new file in this folder
     Ctrl+D / F7                  create a new folder in this folder
-    F2                           rename the highlighted file or folder (Ctrl+U clears the name)
-    Ctrl+C / Ctrl+V (file list)  copy the marked (or highlighted) entries / paste them into this folder;
+    Ctrl+E / F2                  rename the highlighted file or folder (Ctrl+U clears the name)
+    Ctrl+C / Ctrl+V (file list)  copy the marked (or highlighted) entries / paste them into this folder
     Ctrl+X (file list)           cut: the next Ctrl+V moves the entries into that folder
                                  if a name already exists it asks: replace, keep both ("name (copy)" /
                                  "name (2)" for moves), skip, or cancel
+    Ctrl+H / F1                  show this list of keys in the preview (again: close it)
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
@@ -394,12 +396,21 @@ class Preview:
     """What the right pane shows for one path."""
 
     output = False             # True: showing what the program printed (Ctrl+R), not the file
+    readonly = None            # why this view can't be edited (program output, key help)
+
+    @classmethod
+    def text_view(cls, path, info, readonly):
+        """A read-only text view that isn't the file at path (program output, key help)."""
+        p = cls.__new__(cls)
+        p.path, p.kind, p.message, p.entries, p.lexer = path, "text", [], [], None
+        p.file, p.info, p.readonly = OutputText(), info, readonly
+        return p
 
     @classmethod
     def program_output(cls, path):
-        p = cls.__new__(cls)
-        p.path, p.kind, p.message, p.entries, p.lexer = path, "text", [], [], None
-        p.file, p.output, p.info = OutputText(), True, f"running {os.path.basename(path)}"
+        p = cls.text_view(path, f"running {os.path.basename(path)}",
+                          "this is the program's output (read-only); Ctrl+R runs it again")
+        p.output = True
         return p
 
     def __init__(self, path, hl):
@@ -809,16 +820,16 @@ class App:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         run = "^R stop  " if self.proc else "^R run  " if self.preview and self.preview.path.endswith(".py") else ""
         if self.focus == "list":
-            keys = run + "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  F2 rename  ^N new  ^D folder  ^Q quit "
+            keys = run + "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  ^E rename  ^N new  ^D folder  ^H help  ^Q quit "
         else:
-            keys = run + "^S save  ⇧ select  ^A all  ^F find  ^C copy  ^V paste  ^Z undo  Esc back  ^Q quit "
+            keys = run + "^S save  ⇧ select  ^A all  ^F find  ^C copy  ^V paste  ^Z undo  Esc back  ^H help  ^Q quit "
         self.put(h - 1, 0, " " * w, w, self.attr(10))
         self.put(h - 1, 0, left, w, self.attr(10))
         mid = f"  {info}  "
         self.put(h - 1, len(left), mid, max(0, w - len(left)), self.attr(10, curses.A_BOLD))
-        hints = keys.split("  ")              # too narrow: drop hints right to left, keeping "^Q quit"
-        while len(hints) > 1 and w - len(keys) <= len(left) + len(mid):
-            del hints[-2]
+        hints = keys.split("  ")              # too narrow: drop hints right to left, keeping help + quit
+        while len(hints) > 2 and w - len(keys) <= len(left) + len(mid):
+            del hints[-3]
             keys = "  ".join(hints)
         start = w - len(keys)
         if start > len(left) + len(mid):
@@ -1103,8 +1114,8 @@ class App:
             return None
         if isinstance(p.file, EditBuffer):
             return p.file
-        if p.output:
-            self.status = "this is the program's output (read-only); Ctrl+R runs it again"
+        if p.readonly:
+            self.status = p.readonly
             return None
         if p.file.size > EDIT_MAX:
             self.status = f"too large to edit ({human(p.file.size)}, limit {human(EDIT_MAX)})"
@@ -1433,6 +1444,20 @@ class App:
                 return
         self.status = f"{text!r} not found"
 
+    def show_help(self):
+        """Ctrl+H / F1: the key list in the preview; pressed again, back to the file."""
+        if self.preview and self.preview.readonly and not self.preview.output:
+            self.refresh_preview()
+            self.set_focus("list")
+            return
+        path = self.preview.path if self.preview else self.cwd
+        self.refresh_preview()
+        if self.preview:
+            self.preview.close()
+        self.preview = Preview.text_view(path, "keys", "this is the key list; Ctrl+H or Esc closes it")
+        self.preview.file.feed(__doc__[__doc__.index("Keys"):].rstrip().encode() + b"\n")
+        self.set_focus("preview")
+
     def run_program(self):
         """Ctrl+R: run the highlighted .py file; its output replaces the preview. Again: stop it."""
         if self.proc:
@@ -1726,15 +1751,17 @@ class App:
                 self.copy_files(cut=True)
             elif self.focus == "list" and k == "\x16":    # Ctrl+V in the list: paste files here
                 self.paste_files()
+            elif k in ("\x08", curses.KEY_F1):   # Ctrl+H / F1: key help (Backspace sends ^?, not ^H)
+                self.show_help()
             elif k == "\x12":                 # Ctrl+R: run the .py file (again: stop it)
                 self.run_program()
             elif k == "\x06":                 # Ctrl+F: find text in the preview
                 self.prompt = ["Find: ", self.last_find, self.find]
-            elif k == curses.KEY_F3 or (isinstance(k, int) and curses.keyname(k) == b"KEY_F(15)"):
-                self.find(self.last_find, back=k != curses.KEY_F3)    # F3 next, Shift+F3 previous
+            elif k in (curses.KEY_F3, "\x07") or (isinstance(k, int) and curses.keyname(k) == b"KEY_F(15)"):
+                self.find(self.last_find, back=k == curses.KEY_F15)   # F3 / Ctrl+G next, Shift+F3 previous
             elif k in (curses.KEY_F7, "\x04"):   # F7 / Ctrl+D: new folder here (laptops often eat bare F7)
                 self.prompt = ["New folder name: ", "", self.create_folder]
-            elif k == curses.KEY_F2:              # F2: rename the highlighted entry
+            elif k in (curses.KEY_F2, "\x05"):   # F2 / Ctrl+E: rename the highlighted entry
                 self.ask_rename()
             elif self.focus == "preview" and self.preview_key(k, ph):
                 pass
@@ -1791,6 +1818,8 @@ class App:
                 if self.focus == "list":
                     self.marked = set()
                 if not self.unsaved():            # with unsaved edits Esc only drops the selection
+                    if self.preview and self.preview.readonly and not self.preview.output:
+                        self.refresh_preview()    # close the key help
                     self.set_focus("list")        # back to the file list to pick another file
             self.autoscroll()
             self.draw()
