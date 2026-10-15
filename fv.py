@@ -22,8 +22,9 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Ctrl+Z                       undo (typing is undone a run at a time)
     Ctrl+F                       find text (case-insensitive); F3 or Ctrl+G = next match,
                                  Shift+F3 = previous match
-    Ctrl+R                       run the highlighted .py file with python3; its output replaces the
-                                 preview (Ctrl+R again while it runs: stop it)
+    Ctrl+R                       run the highlighted .py (python3) or .sh (bash) file; its output
+                                 replaces the preview (Ctrl+R again while it runs: stop it;
+                                 Esc: back to the file's contents)
     Esc                          back to the file list (asks to save if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
@@ -409,7 +410,7 @@ class Preview:
     @classmethod
     def program_output(cls, path):
         p = cls.text_view(path, f"running {os.path.basename(path)}",
-                          "this is the program's output (read-only); Ctrl+R runs it again")
+                          "this is the program's output (read-only); Esc shows the file, Ctrl+R runs it again")
         p.output = True
         return p
 
@@ -818,7 +819,7 @@ class App:
             left += f"  sel all ({f.count()} lines)" if f.eof else f"  sel all ({human(f.size)})"
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
-        run = "^R stop  " if self.proc else "^R run  " if self.preview and self.preview.path.endswith(".py") else ""
+        run = "^R stop  " if self.proc else "^R run  " if self.preview and self.preview.path.endswith((".py", ".sh")) else ""
         if self.focus == "list":
             keys = run + "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  ^E rename  ^N new  ^D folder  ^H help  ^Q quit "
         else:
@@ -1459,7 +1460,7 @@ class App:
         self.set_focus("preview")
 
     def run_program(self):
-        """Ctrl+R: run the highlighted .py file; its output replaces the preview. Again: stop it."""
+        """Ctrl+R: run the highlighted .py / .sh file; its output replaces the preview. Again: stop it."""
         if self.proc:
             self.stop_program()
             self.status = "stopped"
@@ -1467,21 +1468,26 @@ class App:
         if not self.entries:
             return
         path = os.path.join(self.cwd, self.entries[self.sel][0])
-        if not (path.endswith(".py") and os.path.isfile(path)):
-            self.status = "Ctrl+R runs Python files (.py)"
+        if not (path.endswith((".py", ".sh")) and os.path.isfile(path)):
+            self.status = "Ctrl+R runs Python (.py) and shell (.sh) files"
             return
-        python = shutil.which("python3") or shutil.which("python") or sys.executable
+        if path.endswith(".sh"):
+            prog = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+            cmd = [prog, path]
+        else:
+            prog = shutil.which("python3") or shutil.which("python") or sys.executable
+            cmd = [prog, "-u", path]
         try:
-            proc = subprocess.Popen([python, "-u", path], cwd=self.cwd, stdin=subprocess.DEVNULL,
+            proc = subprocess.Popen(cmd, cwd=self.cwd, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     start_new_session=True)    # its own group: stop kills its children too
         except OSError as e:
-            self.status = f"cannot run {python}: {e.strerror}"
+            self.status = f"cannot run {prog}: {e.strerror}"
             return
         self.refresh_preview()
         self.preview.close()
         self.preview = Preview.program_output(path)
-        self.preview.file.feed(f"$ {os.path.basename(python)} {os.path.basename(path)}\n".encode())
+        self.preview.file.feed(f"$ {os.path.basename(prog)} {os.path.basename(path)}\n".encode())
         os.set_blocking(proc.stdout.fileno(), False)
         self.proc, self.proc_start, self.proc_kept = proc, time.monotonic(), 0
         self.set_focus("preview")
@@ -1818,8 +1824,11 @@ class App:
                 if self.focus == "list":
                     self.marked = set()
                 if not self.unsaved():            # with unsaved edits Esc only drops the selection
-                    if self.preview and self.preview.readonly and not self.preview.output:
-                        self.refresh_preview()    # close the key help
+                    if self.preview and self.preview.readonly:
+                        running = self.proc is not None
+                        self.refresh_preview()    # from program output / key help back to the file
+                        if running:
+                            self.status = "stopped the program; showing the file"
                     self.set_focus("list")        # back to the file list to pick another file
             self.autoscroll()
             self.draw()
