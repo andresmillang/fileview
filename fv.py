@@ -28,8 +28,9 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Ctrl+N                       create a new file in this folder
     F2                           rename the highlighted file or folder (Ctrl+U clears the name)
     Ctrl+C / Ctrl+V (file list)  copy the marked (or highlighted) entries / paste them into this folder;
-                                 existing names are kept — copies get "(copy)" added
     Ctrl+X (file list)           cut: the next Ctrl+V moves the entries into that folder
+                                 if a name already exists it asks: replace, keep both ("name (copy)" /
+                                 "name (2)" for moves), skip, or cancel
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
@@ -443,6 +444,7 @@ class App:
         self.pending_delete = None  # names waiting on the "Delete …? y/n" answer
         self.file_clip = []       # absolute paths copied with Ctrl+C (or cut with Ctrl+X) in the file list
         self.clip_cut = False     # True: the next paste moves file_clip instead of copying it
+        self.pasting = None       # paste in progress, waiting on "already exists: r/k/s" (see paste_next)
         self.init_colors()
         self.init_mouse()
         self.init_tty()
@@ -756,7 +758,7 @@ class App:
         start = w - len(keys)
         if start > len(left) + len(mid):
             self.put(h - 1, start, keys, len(keys) - 1, self.attr(10))
-        if self.prompt is not None or self.confirm is not None or self.pending_delete:  # a question
+        if self.prompt is not None or self.confirm is not None or self.pending_delete or self.pasting:  # a question
             ask = self.prompt[0] + self.prompt[1] if self.prompt is not None else self.status
             loud = curses.color_pair(11) if self.has_color else curses.A_REVERSE | curses.A_BOLD
             self.put(h - 1, 0, (" " + ask).ljust(w), w, loud)
@@ -1188,42 +1190,84 @@ class App:
         if not self.file_clip:
             self.status = "nothing to paste: copy files with Ctrl+C or cut them with Ctrl+X first"
             return
-        if self.clip_cut and self.blocked():
+        if self.blocked():
             return
-        done, failed, first, left = 0, [], None, []
-        for src in self.file_clip:
+        self.pasting = {"queue": list(self.file_clip), "done": 0, "failed": [], "skipped": 0,
+                        "first": None, "left": [], "all": None, "ask": None}
+        self.paste_next()
+
+    def paste_next(self, answer=None):
+        """Paste the queued entries; stop to ask when a name already exists (answer = r / k / s)."""
+        p, cut = self.pasting, self.clip_cut
+        while p["queue"]:
+            src = p["queue"][0]
             name = os.path.basename(src)
-            if self.clip_cut and os.path.realpath(os.path.dirname(src)) == os.path.realpath(self.cwd):
-                failed.append(f"{name}: already in this folder")
-                left.append(src)
-                continue
-            dest = os.path.join(self.cwd, unique_name(self.cwd, name))
-            try:
-                if os.path.isdir(src) and not os.path.islink(src):
-                    real = os.path.realpath(src)
-                    if os.path.realpath(self.cwd) == real or os.path.realpath(self.cwd).startswith(real + os.sep):
-                        failed.append(f"{name}: can't {'move' if self.clip_cut else 'paste'} a folder into itself")
-                        left.append(src)
-                        continue
-                    if self.clip_cut:
-                        shutil.move(src, dest)
-                    else:
-                        shutil.copytree(src, dest, symlinks=True)
-                elif self.clip_cut:
-                    shutil.move(src, dest)
+            dest = os.path.join(self.cwd, name)
+            problem = None
+            if cut and os.path.realpath(os.path.dirname(src)) == os.path.realpath(self.cwd):
+                problem = "already in this folder"
+            elif os.path.isdir(src) and not os.path.islink(src):
+                real = os.path.realpath(src)
+                if os.path.realpath(self.cwd) == real or os.path.realpath(self.cwd).startswith(real + os.sep):
+                    problem = f"can't {'move' if cut else 'paste'} a folder into itself"
+            choice = "k"
+            if not problem and os.path.lexists(dest) and not same_entry(src, dest):
+                choice = answer or p["all"]
+                if choice is None:
+                    p["ask"] = (f"{name} already exists here: r = replace, k = keep both, s = skip"
+                                f"  (R/K/S = for all), Esc = cancel")
+                    self.status = p["ask"]
+                    return
+                answer = None
+                if choice == "r" and os.path.realpath(src).startswith(os.path.realpath(dest) + os.sep):
+                    problem = "can't replace the folder it is in"
+            p["queue"].pop(0)
+            if problem or choice == "s":
+                if problem:
+                    p["failed"].append(f"{name}: {problem}")
                 else:
-                    shutil.copy2(src, dest, follow_symlinks=False)
-                done += 1
-                first = first or os.path.basename(dest)
+                    p["skipped"] += 1
+                p["left"].append(src)
+                continue
+            try:
+                if choice == "r":
+                    tmp = os.path.join(self.cwd, unique_name(self.cwd, f".{name}.fv-partial"))
+                    try:
+                        transfer(src, tmp, cut)        # old entry is only removed once the new one is complete
+                    except BaseException:
+                        if os.path.lexists(tmp):
+                            remove_entry(tmp)
+                        raise
+                    try:
+                        remove_entry(dest)
+                        os.rename(tmp, dest)
+                    except OSError:
+                        if cut:
+                            shutil.move(tmp, src)      # put it back where it was cut from
+                        else:
+                            remove_entry(tmp)
+                        raise
+                else:
+                    dest = os.path.join(self.cwd, unique_name(self.cwd, name, move=cut))
+                    transfer(src, dest, cut)
+                p["done"] += 1
+                p["first"] = p["first"] or os.path.basename(dest)
             except (OSError, shutil.Error) as e:
-                failed.append(f"{name}: {getattr(e, 'strerror', None) or e}")
-                left.append(src)
+                p["failed"].append(f"{name}: {getattr(e, 'strerror', None) or e}")
+                p["left"].append(src)
+        self.finish_paste()
+
+    def finish_paste(self, cancelled=False):
+        p, self.pasting = self.pasting, None
         verb = "moved" if self.clip_cut else "pasted"
         if self.clip_cut:
-            self.file_clip = left      # moved entries no longer exist where they were cut
-        self.load_dir(focus=first)
-        self.status = f"{verb} {done}" + (f" ({first}{', …' if done > 1 else ''})" if done else "") + (
-            f"; not {verb}: {'; '.join(failed)}" if failed else "")
+            self.file_clip = p["left"] + p["queue"]   # moved entries no longer exist where they were cut
+        self.load_dir(focus=p["first"])
+        done, first = p["done"], p["first"]
+        self.status = ("cancelled: " if cancelled else "") + f"{verb} {done}" + (
+            f" ({first}{', …' if done > 1 else ''})" if done else "") + (
+            f"; skipped {p['skipped']}" if p["skipped"] else "") + (
+            f"; not {verb}: {'; '.join(p['failed'])}" if p["failed"] else "")
 
     def ask_rename(self):
         if not self.entries or self.entries[self.sel][0] == "..":
@@ -1434,6 +1478,17 @@ class App:
                     self.status = "not deleted"
                 self.draw()
                 continue
+            if self.pasting and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
+                if k in ("r", "k", "s", "R", "K", "S"):
+                    if k.isupper():
+                        self.pasting["all"] = k.lower()
+                    self.paste_next(k.lower())
+                elif k == "\x1b":
+                    self.finish_paste(cancelled=True)
+                else:
+                    self.status = self.pasting["ask"]          # keep asking
+                self.draw()
+                continue
             if self.prompt is not None and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
                 self.prompt_key(k)
                 self.draw()
@@ -1587,17 +1642,43 @@ def copy_to_clipboard(data):
     return " + ".join(used)
 
 
-def unique_name(folder, name):
-    """name, or 'base (copy).ext', 'base (copy 2).ext', ... — whichever doesn't exist yet."""
+def unique_name(folder, name, move=False):
+    """name, or the first free 'base (copy).ext', 'base (copy 2).ext', ... (moves: 'base (2).ext', ...)."""
     if not os.path.lexists(os.path.join(folder, name)):
         return name
     base, ext = os.path.splitext(name)
-    n = 1
+    n = 2 if move else 1
     while True:
-        candidate = f"{base} (copy{'' if n == 1 else f' {n}'}){ext}"
+        candidate = f"{base} ({n}){ext}" if move else f"{base} (copy{'' if n == 1 else f' {n}'}){ext}"
         if not os.path.lexists(os.path.join(folder, candidate)):
             return candidate
         n += 1
+
+
+def same_entry(a, b):
+    """True when two paths are the same directory entry (symlinks not followed)."""
+    try:
+        sa, sb = os.lstat(a), os.lstat(b)
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def transfer(src, dest, move):
+    """Move, or copy (folders recursively, symlinks as links, metadata kept), src to the free path dest."""
+    if move:
+        shutil.move(src, dest)
+    elif os.path.isdir(src) and not os.path.islink(src):
+        shutil.copytree(src, dest, symlinks=True)
+    else:
+        shutil.copy2(src, dest, follow_symlinks=False)
+
+
+def remove_entry(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
 
 
 def read_clipboard():

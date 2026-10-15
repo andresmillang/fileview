@@ -67,8 +67,9 @@ python3 fv.py [DIRECTORY]
 | Esc | clear the selection, marks or a typed name, and return to the file list |
 | Ctrl+N | create a new empty file in the current folder (asks for the name; Esc cancels) |
 | F2 | rename the highlighted file or folder (pre-filled; Ctrl+U clears; never overwrites an existing name) |
-| Ctrl+C / Ctrl+V | copy the marked (or highlighted) files and folders / paste them into the current folder; an existing name is never overwritten — the copy becomes `name (copy).ext` |
-| Ctrl+X | cut the marked (or highlighted) files and folders; the next Ctrl+V moves them into the current folder (never overwrites either) |
+| Ctrl+C / Ctrl+V | copy the marked (or highlighted) files and folders / paste them into the current folder |
+| Ctrl+X | cut the marked (or highlighted) files and folders; the next Ctrl+V moves them into the current folder |
+| | when pasting over an existing name it asks: **r** replace, **k** keep both (`name (copy).ext` for copies, `name (2).ext` for moves), **s** skip, Esc cancel; **R/K/S** answer for all the remaining ones |
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |
