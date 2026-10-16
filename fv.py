@@ -40,6 +40,8 @@ Keys (Tab or a mouse click picks the panel the keys act on)
                                  if a name already exists it asks: replace, keep both ("name (copy)" /
                                  "name (2)" for moves), skip, or cancel
     Ctrl+H / F1                  show this list of keys in the preview (again: close it)
+    Ctrl+P / click the bar       type or paste a folder or file path into the bar above the preview;
+                                 Enter opens the folder, or the file's folder with the file open
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
@@ -60,6 +62,7 @@ import subprocess
 import sys
 import termios
 import time
+import urllib.parse
 
 CHUNK = 64 * 1024
 SNIFF = 8192
@@ -493,7 +496,8 @@ class App:
         self.sel = 0
         self.top = 0
         self.ptop = 0             # preview scroll
-        self.focus = "list"       # "list" | "preview": which panel the keys act on
+        self.focus = "list"       # "list" | "preview" | "path": which panel the keys act on
+        self.path_text = ""       # text typed or pasted into the path bar above the preview
         self.find_buf = ""        # type-to-navigate prefix (casefolded)
         self.find_time = 0.0
         self.folded = []          # casefolded entry names, parallel to self.entries
@@ -709,7 +713,7 @@ class App:
                 self.move(idx - self.sel)
 
     def set_focus(self, panel):
-        if panel == "preview" and self.layout()[2] >= self.layout()[1]:
+        if panel in ("preview", "path") and self.layout()[2] >= self.layout()[1]:
             return                    # too narrow: preview isn't shown
         self.focus = panel
 
@@ -721,6 +725,59 @@ class App:
             came_from = os.path.basename(self.cwd)
             self.cwd = parent
             self.load_dir(focus=came_from)
+
+    def go_to_path(self, text):
+        """Path bar Enter: open a folder, or a file's folder with that file highlighted and open."""
+        text = text.strip().strip("'\"")
+        if text.startswith("file://"):            # pasted from a graphical file manager
+            text = urllib.parse.unquote(text[len("file://"):])
+        if not text:
+            return
+        path = os.path.normpath(os.path.join(self.cwd, os.path.expanduser(text)))
+        if not os.path.lexists(path):
+            self.status = f"no such file or folder: {text}"
+            return
+        if self.blocked():
+            return
+        self.path_text = ""
+        if os.path.isdir(path):
+            if not os.access(path, os.R_OK | os.X_OK):
+                self.status = f"Permission denied: {path}"
+                return
+            self.cwd = path
+            self.load_dir()
+            return
+        folder, name = os.path.split(path)
+        if name.startswith(".") and not self.show_hidden:
+            self.show_hidden = True               # otherwise the file wouldn't be in the list
+        self.cwd = folder
+        self.load_dir(focus=name)
+        self.set_focus("preview")
+
+    def path_key(self, k):
+        """Keys while the path bar has focus. Returns True if consumed."""
+        if k in ("\n", "\r", curses.KEY_ENTER):
+            self.go_to_path(self.path_text)
+            if self.focus == "path" and not self.path_text:
+                self.set_focus("list")
+        elif k in ("\x1b", "\t"):
+            self.path_text = ""
+            self.set_focus("list")
+        elif k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            self.path_text = self.path_text[:-1]
+        elif k == "\x15":                     # Ctrl+U: clear
+            self.path_text = ""
+        elif k == "\x16":                     # Ctrl+V: paste from the system clipboard
+            text = read_clipboard()
+            if text is None:
+                self.status = "no clipboard tool to paste from; use your terminal's paste (Ctrl+Shift+V)"
+            else:
+                self.path_text += text.strip().splitlines()[0] if text.strip() else ""
+        elif k in ("\x11", "\x0c", curses.KEY_RESIZE):   # Ctrl+Q, Ctrl+L: as anywhere else
+            return False
+        elif isinstance(k, str) and k.isprintable():
+            self.path_text += k
+        return True
 
     def preview_lines_total(self):
         p = self.preview
@@ -806,7 +863,8 @@ class App:
                     self.scr.addch(y, lw - 1, curses.ACS_VLINE, div)
                 except curses.error:
                     pass
-            self.draw_preview(1, lw + 1, body, w - lw - 1)
+            self.draw_path_bar(1, lw, w - lw)
+            self.draw_preview(2, lw + 1, body - 1, w - lw - 1)
 
         # footer
         info = ""
@@ -832,7 +890,9 @@ class App:
         elif rng:
             left += f"  sel {rng[1][0] - rng[0][0] + 1} lines"
         run = "^R stop  " if self.proc else "^R run  " if self.preview and runnable(self.preview.path) else ""
-        if self.focus == "list":
+        if self.focus == "path":
+            keys = "Enter go  ^V paste  ^U clear  Esc back  ^Q quit "
+        elif self.focus == "list":
             keys = run + "Spc mark  ^C copy  ^X cut  ^V paste  Del delete  ^E rename  ^N new  ^D folder  ^H help  ^Q quit "
         else:
             keys = run + "^S save  ⇧ select  ^A all  ^F find  ^C copy  ^V paste  ^Z undo  Esc back  ^H help  ^Q quit "
@@ -864,6 +924,13 @@ class App:
                 show = True
             except curses.error:
                 pass
+        elif self.focus == "path":
+            h, w, lw = self.layout()
+            try:
+                self.scr.move(1, min(w - 1, lw + len(self.path_bar_text(w - lw)[0])))
+                show = True
+            except curses.error:
+                pass
         elif self.focus == "preview" and p is not None and p.kind == "text" and g:
             y0, x0, ph, gw, cw = g
             l, c = self.cur
@@ -879,6 +946,22 @@ class App:
             curses.curs_set(1 if show else 0)
         except curses.error:
             pass
+
+    def path_bar_text(self, width):
+        """(text up to the cursor, placeholder) for the path bar; long input shows its end."""
+        if self.focus != "path" and not self.path_text:
+            return "", " Go to: paste a folder or file path here (click or Ctrl+P)"
+        label = " Go to: "
+        room = max(1, width - len(label) - 1)
+        return label + self.path_text[-room:], ""
+
+    def draw_path_bar(self, y, x, width):
+        text, hint = self.path_bar_text(width)
+        if self.focus == "path":
+            a = curses.color_pair(11) if self.has_color else curses.A_REVERSE
+        else:
+            a = self.attr(10)
+        self.put(y, x, (text or hint).ljust(width), width, a)
 
     def draw_preview(self, y0, x0, ph, pw):
         p = self.preview
@@ -1449,7 +1532,7 @@ class App:
                 m = hits[-1] if back else hits[0]
                 wrapped = step == n or (l > start[0] if back else l < start[0])
                 h, _, _ = self.layout()
-                ph = max(1, h - 2)
+                ph = max(1, h - 3)
                 self.set_focus("preview")
                 self.set_cursor((l, m.start()), ph)
                 self.set_cursor((l, m.end()), ph, extend=True)
@@ -1517,7 +1600,7 @@ class App:
         p, proc = self.preview, self.proc
         out = p.file
         h, _, _ = self.layout()
-        ph = max(1, h - 2)
+        ph = max(1, h - 3)
         follow = self.ptop + ph >= out.count()      # end of output visible: keep showing the end
         while True:
             try:
@@ -1611,7 +1694,9 @@ class App:
             if x < self.layout()[2] and self.blocked():
                 return
             self.set_focus("preview" if x >= self.layout()[2] else "list")
-            if text_preview and self.in_preview(y, x):
+            if y == 1 and x >= self.layout()[2]:
+                self.set_focus("path")            # click on the path bar
+            elif text_preview and self.in_preview(y, x):
                 self.status = ""
                 self.dragging = True
                 self.drag_yx = (y, x)
@@ -1645,7 +1730,7 @@ class App:
             step = -3 if bstate & curses.BUTTON4_PRESSED else 3
             h, _, lw = self.layout()
             if x >= lw:
-                self.scroll_preview(step, max(1, h - 2))
+                self.scroll_preview(step, max(1, h - 3))
             else:
                 self.move(step)
 
@@ -1726,6 +1811,9 @@ class App:
                     self.status = self.pasting["ask"]          # keep asking
                 self.draw()
                 continue
+            if self.focus == "path" and k not in (None, curses.KEY_MOUSE) and self.path_key(k):
+                self.draw()
+                continue
             if self.prompt is not None and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
                 self.prompt_key(k)
                 self.draw()
@@ -1761,6 +1849,8 @@ class App:
                 break
             elif k == "\x13":                 # Ctrl+S
                 self.save()
+            elif k == "\x10":                 # Ctrl+P: type or paste a path into the path bar
+                self.set_focus("path")
             elif k == "\x0e":                 # Ctrl+N: new file in this folder
                 self.prompt = ["New file name: ", "", self.create_file]
             elif self.focus == "list" and k == "\x03":    # Ctrl+C in the list: copy files
@@ -1781,7 +1871,7 @@ class App:
                 self.prompt = ["New folder name: ", "", self.create_folder]
             elif k in (curses.KEY_F2, "\x05"):   # F2 / Ctrl+E: rename the highlighted entry
                 self.ask_rename()
-            elif self.focus == "preview" and self.preview_key(k, ph):
+            elif self.focus == "preview" and self.preview_key(k, max(1, ph - 1)):
                 pass
             elif k == "\t":
                 self.set_focus("preview" if self.focus == "list" else "list")

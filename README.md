@@ -10,6 +10,7 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - Friendly messages for binary, empty, unreadable, and special files
 - Type-to-navigate: type the start of a name to jump to it, like a graphical file browser
 - `../` at the top of every folder to go up one level; Ctrl+N creates a new file, Ctrl+D (or F7) a new folder
+- A path bar above the preview: paste a folder or file path (Ctrl+P or click it) and press Enter to jump there; a file is highlighted and opened
 - Find text in the previewed file with Ctrl+F (F3 or Ctrl+G / Shift+F3 for the next / previous match)
 - Run scripts and programs with Ctrl+R (Python, shell, Node, Perl, anything with a `#!` line, executables): the output streams into the right panel (Esc shows the file again)
 - Folders in bright blue, runnable files in bright green
@@ -79,6 +80,7 @@ python3 fv.py [DIRECTORY]
 | Ctrl+X | cut the marked (or highlighted) files and folders; the next Ctrl+V moves them into the current folder |
 | | when pasting over an existing name it asks: **r** replace, **k** keep both (`name (copy).ext` for copies, `name (2).ext` for moves), **s** skip, Esc cancel; **R/K/S** answer for all the remaining ones |
 | Ctrl+H / F1 | show the list of keys in the right panel (Ctrl+H again or Esc closes it) |
+| Ctrl+P / click the bar | type or paste a path into the bar above the preview (Ctrl+V pastes from the clipboard, Ctrl+U clears, Esc leaves it). Enter opens a folder, or goes to a file's folder with the file highlighted and open. Relative paths, `~`, quotes and `file://` links work |
 | Ctrl+T | show/hide hidden files |
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |
