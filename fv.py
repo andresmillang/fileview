@@ -40,7 +40,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
                                  if a name already exists it asks: replace, keep both ("name (copy)" /
                                  "name (2)" for moves), skip, or cancel
     Ctrl+H / F1                  show this list of keys in the preview (again: close it)
-    Ctrl+P / click the bar       type or paste a folder or file path into the bar above the preview;
+    Ctrl+P / click the top bar   type or paste a folder or file path into the top bar;
                                  Enter opens the folder, or the file's folder with the file open
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
@@ -497,7 +497,7 @@ class App:
         self.top = 0
         self.ptop = 0             # preview scroll
         self.focus = "list"       # "list" | "preview" | "path": which panel the keys act on
-        self.path_text = ""       # text typed or pasted into the path bar above the preview
+        self.path_text = ""       # text typed or pasted into the top bar (Ctrl+P / click)
         self.find_buf = ""        # type-to-navigate prefix (casefolded)
         self.find_time = 0.0
         self.folded = []          # casefolded entry names, parallel to self.entries
@@ -713,7 +713,7 @@ class App:
                 self.move(idx - self.sel)
 
     def set_focus(self, panel):
-        if panel in ("preview", "path") and self.layout()[2] >= self.layout()[1]:
+        if panel == "preview" and self.layout()[2] >= self.layout()[1]:
             return                    # too narrow: preview isn't shown
         self.focus = panel
 
@@ -828,9 +828,8 @@ class App:
             self.scr.refresh()
             return
 
-        # header
-        hdr = f" {self.cwd}"
-        self.put(0, 0, hdr.ljust(w), w, self.attr(10, curses.A_BOLD))
+        # header: the current folder, and the input for Ctrl+P / a click
+        self.draw_path_bar(w)
 
         # left pane
         if self.sel < self.top:
@@ -863,8 +862,7 @@ class App:
                     self.scr.addch(y, lw - 1, curses.ACS_VLINE, div)
                 except curses.error:
                     pass
-            self.draw_path_bar(1, lw, w - lw)
-            self.draw_preview(2, lw + 1, body - 1, w - lw - 1)
+            self.draw_preview(1, lw + 1, body, w - lw - 1)
 
         # footer
         info = ""
@@ -925,9 +923,9 @@ class App:
             except curses.error:
                 pass
         elif self.focus == "path":
-            h, w, lw = self.layout()
+            h, w = self.scr.getmaxyx()
             try:
-                self.scr.move(1, min(w - 1, lw + len(self.path_bar_text(w - lw)[0])))
+                self.scr.move(0, min(w - 1, len(self.path_bar_text(w))))
                 show = True
             except curses.error:
                 pass
@@ -948,20 +946,24 @@ class App:
             pass
 
     def path_bar_text(self, width):
-        """(text up to the cursor, placeholder) for the path bar; long input shows its end."""
-        if self.focus != "path" and not self.path_text:
-            return "", " Go to: paste a folder or file path here (click or Ctrl+P)"
+        """The header while typing a path: label + input (long input shows its end)."""
         label = " Go to: "
-        room = max(1, width - len(label) - 1)
-        return label + self.path_text[-room:], ""
+        return label + self.path_text[-max(1, width - len(label) - 1):]
 
-    def draw_path_bar(self, y, x, width):
-        text, hint = self.path_bar_text(width)
+    def draw_path_bar(self, w):
         if self.focus == "path":
             a = curses.color_pair(11) if self.has_color else curses.A_REVERSE
-        else:
-            a = self.attr(10)
-        self.put(y, x, (text or hint).ljust(width), width, a)
+            self.put(0, 0, self.path_bar_text(w).ljust(w), w, a)
+            return
+        hint = "click or ^P: go to a path "
+        hdr = f" {self.cwd}"
+        room = w - len(hint) - 1
+        if room < 20:
+            hint = ""                             # too narrow: just the folder
+        elif len(hdr) > room:
+            hdr = " …" + self.cwd[-(room - 2):]   # long folder: keep its end, and the hint
+        self.put(0, 0, hdr.ljust(w), w, self.attr(10, curses.A_BOLD))
+        self.put(0, w - len(hint), hint, len(hint) - 1, self.attr(10))
 
     def draw_preview(self, y0, x0, ph, pw):
         p = self.preview
@@ -1532,7 +1534,7 @@ class App:
                 m = hits[-1] if back else hits[0]
                 wrapped = step == n or (l > start[0] if back else l < start[0])
                 h, _, _ = self.layout()
-                ph = max(1, h - 3)
+                ph = max(1, h - 2)
                 self.set_focus("preview")
                 self.set_cursor((l, m.start()), ph)
                 self.set_cursor((l, m.end()), ph, extend=True)
@@ -1600,7 +1602,7 @@ class App:
         p, proc = self.preview, self.proc
         out = p.file
         h, _, _ = self.layout()
-        ph = max(1, h - 3)
+        ph = max(1, h - 2)
         follow = self.ptop + ph >= out.count()      # end of output visible: keep showing the end
         while True:
             try:
@@ -1691,11 +1693,12 @@ class App:
         p = self.preview
         text_preview = p is not None and p.kind == "text"
         if bstate & curses.BUTTON1_PRESSED:
-            if x < self.layout()[2] and self.blocked():
+            if y > 0 and x < self.layout()[2] and self.blocked():
                 return
-            self.set_focus("preview" if x >= self.layout()[2] else "list")
-            if y == 1 and x >= self.layout()[2]:
-                self.set_focus("path")            # click on the path bar
+            if y > 0:
+                self.set_focus("preview" if x >= self.layout()[2] else "list")
+            if y == 0:
+                self.set_focus("path")            # click on the header: type a path
             elif text_preview and self.in_preview(y, x):
                 self.status = ""
                 self.dragging = True
@@ -1730,7 +1733,7 @@ class App:
             step = -3 if bstate & curses.BUTTON4_PRESSED else 3
             h, _, lw = self.layout()
             if x >= lw:
-                self.scroll_preview(step, max(1, h - 3))
+                self.scroll_preview(step, max(1, h - 2))
             else:
                 self.move(step)
 
@@ -1871,7 +1874,7 @@ class App:
                 self.prompt = ["New folder name: ", "", self.create_folder]
             elif k in (curses.KEY_F2, "\x05"):   # F2 / Ctrl+E: rename the highlighted entry
                 self.ask_rename()
-            elif self.focus == "preview" and self.preview_key(k, max(1, ph - 1)):
+            elif self.focus == "preview" and self.preview_key(k, ph):
                 pass
             elif k == "\t":
                 self.set_focus("preview" if self.focus == "list" else "list")
