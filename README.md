@@ -107,9 +107,18 @@ Files with these extensions are shown in green.
 ## Mouse on a server's text console
 
 Over SSH and in desktop terminals the mouse just works. On the Linux text console (logged in
-directly on the machine, no desktop) there is no mouse pointer at all unless the **gpm** service
-is installed and running: `sudo apt install gpm` (if it still doesn't work, `sudo systemctl start gpm`), then restart fv. fv mentions this at startup when it runs on
-the console without gpm.
+directly on the machine, no desktop) the mouse needs the **gpm** service. When fv starts there
+without it, it offers to set it up:
+
+```
+No mouse on this console. Set it up now? y = run: sudo apt-get install -y gpm && sudo systemctl enable --now gpm
+```
+
+Press **y** and fv steps aside so the command runs in the terminal itself. `sudo` asks for your
+password directly (fv never sees it), and fv starts again with the mouse on. The install step is
+left out when gpm is already installed; `dnf`, `pacman` and `zypper` are used where `apt-get` isn't
+there, and `sudo` is left out when you're root. **n** skips it and shows the command to run later;
+Ctrl+C at the password prompt cancels the setup and goes back to fv.
 
 Copying uses `wl-copy`, `xclip`, `xsel`, `pbcopy` or `clip.exe` when available, and also sends
 OSC 52 (up to 1 MB) so it works over SSH and in tmux, if the terminal allows clipboard writes.

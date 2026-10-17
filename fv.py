@@ -47,6 +47,7 @@ Keys (Tab or a mouse click picks the panel the keys act on)
     Ctrl+T                       toggle hidden files
     Ctrl+L                       redraw the screen
     mouse wheel                  scroll the panel under the pointer
+                                 (on the Linux text console fv offers to install and start gpm for it)
     Ctrl+Q                       quit
 """
 import array
@@ -82,6 +83,7 @@ EDIT_MAX = 10 << 20      # files up to this size (UTF-8 text) can be edited
 OUTPUT_MAX = 10 << 20    # keep at most this much output of a program run with Ctrl+R
 RUN_EXT = {".py": None, ".sh": ("bash", "sh"), ".js": ("node",), ".mjs": ("node",), ".cjs": ("node",),
            ".pl": ("perl",)}  # Ctrl+R runs these with the first interpreter found (.py: see run_command)
+GPM_SOCKET = "/dev/gpmctl"     # exists while the gpm console-mouse service runs
 RUN_CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "fv", "run.conf")
 RUN_CONF_HEADER = """\
 # fv: the commands Ctrl+R uses, one per line:   .extension = command
@@ -537,6 +539,8 @@ class App:
         self.file_clip = []       # absolute paths copied with Ctrl+C (or cut with Ctrl+X) in the file list
         self.clip_cut = False     # True: the next paste moves file_clip instead of copying it
         self.pasting = None       # paste in progress, waiting on "already exists: r/k/s" (see paste_next)
+        self.ask_mouse = None     # gpm setup command waiting on "Set it up now? y/n" (Linux console only)
+        self.restart = False      # True: main() starts fv again (after setting up the mouse)
         self.init_colors()
         self.init_mouse()
         self.init_tty()
@@ -580,12 +584,15 @@ class App:
         except curses.error:
             avail = 0
         self.mouse = bool(avail)
-        if os.environ.get("TERM") == "linux" and not os.path.exists("/dev/gpmctl"):
+        if os.environ.get("TERM") == "linux" and not os.path.exists(GPM_SOCKET):
             # the Linux text console (no SSH, no desktop) only has a mouse through the gpm service
-            if shutil.which("gpm") or os.path.exists("/usr/sbin/gpm"):
-                self.status = "no mouse: the gpm service isn't running (sudo systemctl start gpm), then restart fv"
+            cmd = gpm_setup_command()
+            if cmd:
+                self.ask_mouse = cmd
+                self.status = (f"No mouse on this console. Set it up now? y = run: {cmd}"
+                               f"{'' if os.geteuid() == 0 else ' (sudo asks for your password)'}, n = not now")
             else:
-                self.status = "no mouse on the text console: install gpm (sudo apt install gpm), then restart fv"
+                self.status = "no mouse on the text console: install and start the gpm service, then restart fv"
         if self.mouse:
             # ncurses only enables mode 1000 (clicks); 1002 adds motion while a button is held
             term_write("\x1b[?1002h")
@@ -924,7 +931,7 @@ class App:
         start = w - len(keys)
         if start > len(left) + len(mid):
             self.put(h - 1, start, keys, len(keys) - 1, self.attr(10))
-        if self.prompt is not None or self.confirm is not None or self.pending_delete or self.pasting:  # a question
+        if self.prompt is not None or self.confirm is not None or self.pending_delete or self.pasting or self.ask_mouse:
             ask = self.prompt[0] + self.prompt[1] if self.prompt is not None else self.status
             loud = curses.color_pair(11) if self.has_color else curses.A_REVERSE | curses.A_BOLD
             self.put(h - 1, 0, (" " + ask).ljust(w), w, loud)
@@ -1638,6 +1645,39 @@ class App:
         if not self.status:
             self.status = f"saved {ext} = {cmd} in {short_path(RUN_CONF)}"
 
+    def setup_mouse(self, cmd):
+        """Run the gpm setup in the real terminal (so sudo can ask for the password itself), then
+        restart fv so curses connects to gpm; on failure, come back with the screen as it was."""
+        curses.def_prog_mode()
+        curses.endwin()
+        term_write("\x1b[?1002l")
+        print(f"\nfv: setting up the console mouse:\n  $ {cmd}\n", flush=True)
+        try:
+            code = subprocess.call(["sh", "-c", cmd],     # Ctrl+C stops the setup, not fv
+                                   preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+        except OSError:
+            code = -1
+        except KeyboardInterrupt:
+            code = 130
+        if code == 0:
+            for _ in range(30):                          # gpm opens its socket a moment after starting
+                if os.path.exists(GPM_SOCKET):
+                    break
+                time.sleep(0.1)
+            print("\nfv: done, restarting fv with the mouse on", flush=True)
+            self.restart = True
+            return
+        print(f"\nfv: the setup did not finish (exit code {code}). Press Enter to go back to fv.", flush=True)
+        try:
+            sys.stdin.readline()
+        except (OSError, KeyboardInterrupt):
+            pass
+        curses.reset_prog_mode()
+        self.scr.clear()
+        if self.mouse:
+            term_write("\x1b[?1002h")
+        self.status = f"mouse setup failed (exit code {code}); you can run it yourself: {cmd}"
+
     def stop_program(self):
         if self.proc:
             try:
@@ -1850,6 +1890,16 @@ class App:
                     self.delete_files(names)
                 else:
                     self.status = "not deleted"
+                self.draw()
+                continue
+            if self.ask_mouse and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
+                cmd, self.ask_mouse = self.ask_mouse, None
+                if k in ("y", "Y"):
+                    self.setup_mouse(cmd)
+                    if self.restart:
+                        break
+                else:
+                    self.status = "no mouse; to set it up later, run: " + cmd
                 self.draw()
                 continue
             if self.pasting and k not in (None, curses.KEY_MOUSE, curses.KEY_RESIZE):
@@ -2177,6 +2227,26 @@ def run_command(path):
     return "Ctrl+R runs .py .sh .js .pl files, scripts starting with #! and executable files"
 
 
+def gpm_setup_command():
+    """Shell command that installs gpm (if needed) and starts it, or None if this system can't."""
+    path = os.environ.get("PATH", "") + ":/usr/sbin:/sbin"
+    sudo = "" if os.geteuid() == 0 else "sudo "
+    if sudo and not shutil.which("sudo", path=path) or not shutil.which("systemctl", path=path):
+        return None
+    steps = []
+    if not shutil.which("gpm", path=path):
+        for tool, install in (("apt-get", "apt-get install -y gpm"), ("dnf", "dnf install -y gpm"),
+                              ("pacman", "pacman -S --noconfirm gpm"),
+                              ("zypper", "zypper --non-interactive install gpm")):
+            if shutil.which(tool, path=path):
+                steps.append(sudo + install)
+                break
+        else:
+            return None
+    steps.append(sudo + "systemctl enable --now gpm")   # start it now, and at every boot
+    return " && ".join(steps)
+
+
 def run_env(cmd):
     env = dict(os.environ, PYTHONUNBUFFERED="1")
     if os.path.basename(cmd[0]) == "uv":
@@ -2231,12 +2301,18 @@ def main():
         sys.exit(f"fv: not a directory: {start}")
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
+    app = []
     try:
-        curses.wrapper(lambda scr: App(scr, start).run())
+        curses.wrapper(lambda scr: (app.append(App(scr, start)), app[0].run()))
     except KeyboardInterrupt:
         pass
+    except curses.error:
+        if not (app and app[0].restart):         # setup_mouse already ended curses: endwin fails again
+            raise
     finally:
         term_write("\x1b[?1002l\x1b[?1006l\x1b[?1000l")
+    if app and app[0].restart:                       # the mouse was just set up: start again with it
+        os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), app[0].cwd])
 
 
 if __name__ == "__main__":
