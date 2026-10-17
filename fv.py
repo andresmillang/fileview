@@ -26,7 +26,9 @@ Keys (Tab or a mouse click picks the panel the keys act on)
                                  inline dependencies / inside a pyproject project), .sh (bash),
                                  .js (node), .pl (perl), any script starting with #!, or an
                                  executable file (shown in green). The output replaces the preview
-                                 (Ctrl+R again while it runs: stop it; Esc: back to the file)
+                                 (Ctrl+R again while it runs: stop it; Esc: back to the file).
+                                 Other extensions: Ctrl+R asks for the command once and saves it in
+                                 ~/.config/fv/run.conf (".rb = ruby"; edit that file to change it)
     Esc                          back to the file list (asks to save if there are unsaved changes)
   Anywhere
     Ctrl+A                       select the whole previewed file
@@ -55,6 +57,7 @@ import errno
 import locale
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -79,6 +82,16 @@ EDIT_MAX = 10 << 20      # files up to this size (UTF-8 text) can be edited
 OUTPUT_MAX = 10 << 20    # keep at most this much output of a program run with Ctrl+R
 RUN_EXT = {".py": None, ".sh": ("bash", "sh"), ".js": ("node",), ".mjs": ("node",), ".cjs": ("node",),
            ".pl": ("perl",)}  # Ctrl+R runs these with the first interpreter found (.py: see run_command)
+RUN_CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "fv", "run.conf")
+RUN_CONF_HEADER = """\
+# fv: the commands Ctrl+R uses, one per line:   .extension = command
+# The file's path is added at the end, or put {file} where it should go.
+# These win over fv's own choices (so .py or .sh can be changed here too).
+#   .rb = ruby
+#   .go = go run
+#   .ts = npx tsx
+#   .c  = sh -c 'cc "$1" -o /tmp/fv-a.out && /tmp/fv-a.out' sh {file}
+"""
 # keys that scroll the preview when it has focus
 PREVIEW_SCROLL = {curses.KEY_UP: "up", curses.KEY_DOWN: "down", curses.KEY_PPAGE: "pgup",
                   curses.KEY_NPAGE: "pgdn", curses.KEY_HOME: "home", curses.KEY_END: "end"}
@@ -567,6 +580,9 @@ class App:
         except curses.error:
             avail = 0
         self.mouse = bool(avail)
+        if os.environ.get("TERM") == "linux" and not os.path.exists("/dev/gpmctl"):
+            # the Linux text console (no SSH, no desktop) only has a mouse through the gpm service
+            self.status = "no mouse on the text console: install gpm (sudo apt install gpm), then restart fv"
         if self.mouse:
             # ncurses only enables mode 1000 (clicks); 1002 adds motion while a button is held
             term_write("\x1b[?1002h")
@@ -1568,6 +1584,11 @@ class App:
         if not os.path.isfile(path):
             self.status = "Ctrl+R runs .py .sh .js .pl files, scripts starting with #! and executable files"
             return
+        ext = os.path.splitext(path)[1].lower()
+        if ext and not runnable(path):               # unknown extension: ask for its command once
+            self.prompt = [f"No command for {ext} files yet. Run them with (e.g. ruby, go run): ", "",
+                           lambda cmd: self.add_run_command(ext, cmd)]
+            return
         cmd = run_command(path)
         if isinstance(cmd, str):
             self.status = cmd
@@ -1583,11 +1604,36 @@ class App:
         self.refresh_preview()
         self.preview.close()
         self.preview = Preview.program_output(path)
-        shown = [os.path.basename(a) if a in (cmd[0], path) else a for a in cmd]
+        shown = [shlex.quote(os.path.basename(a) if a in (cmd[0], path) else a) for a in cmd]
         self.preview.file.feed(f"$ {' '.join(shown)}\n".encode())
         os.set_blocking(proc.stdout.fileno(), False)
         self.proc, self.proc_start, self.proc_kept = proc, time.monotonic(), 0
         self.set_focus("preview")
+
+    def add_run_command(self, ext, cmd):
+        """Save '<ext> = <cmd>' in RUN_CONF, then run the highlighted file with it."""
+        cmd = cmd.strip()
+        if not cmd:
+            self.status = "cancelled"
+            return
+        try:
+            shlex.split(cmd)
+        except ValueError as e:
+            self.status = f"cannot use that command: {e}"
+            return
+        try:
+            os.makedirs(os.path.dirname(RUN_CONF), exist_ok=True)
+            with open(RUN_CONF, "a+", encoding="utf-8") as f:
+                f.seek(0)
+                old = f.read()
+                f.write(("" if old else RUN_CONF_HEADER) + ("\n" if old and not old.endswith("\n") else "")
+                        + f"{ext} = {cmd}\n")
+        except OSError as e:
+            self.status = f"cannot save it in {short_path(RUN_CONF)}: {e.strerror}"
+            return
+        self.run_program()
+        if not self.status:
+            self.status = f"saved {ext} = {cmd} in {short_path(RUN_CONF)}"
 
     def stop_program(self):
         if self.proc:
@@ -2027,11 +2073,42 @@ def remove_entry(path):
         os.remove(path)
 
 
+_run_conf = (None, {})
+
+
+def run_conf():
+    """Extension -> command from RUN_CONF ('.rb = ruby' lines), reread whenever the file changes."""
+    global _run_conf
+    try:
+        mtime = os.stat(RUN_CONF).st_mtime_ns
+    except OSError:
+        return {}
+    if _run_conf[0] != mtime:
+        table = {}
+        try:
+            with open(RUN_CONF, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    ext, eq, cmd = line.partition("=")
+                    ext = ext.strip().lower()
+                    if eq and ext.startswith(".") and cmd.strip():     # comments start with #
+                        table[ext] = cmd.strip()
+        except OSError:
+            pass
+        _run_conf = (mtime, table)
+    return _run_conf[1]
+
+
+def short_path(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
 def runnable(path, check_shebang=True):
-    """Can Ctrl+R run this file? (known extension, executable bit, or a #! first line)"""
+    """Can Ctrl+R run this file? (known or run.conf extension, executable bit, or a #! first line)"""
     if not os.path.isfile(path):
         return False
-    if os.path.splitext(path)[1] in RUN_EXT or os.access(path, os.X_OK):
+    ext = os.path.splitext(path)[1]
+    if ext in RUN_EXT or ext.lower() in run_conf() or os.access(path, os.X_OK):
         return True
     if not check_shebang:
         return False
@@ -2045,6 +2122,20 @@ def runnable(path, check_shebang=True):
 def run_command(path):
     """The command line Ctrl+R uses for path, or a string saying why it can't run."""
     ext = os.path.splitext(path)[1]
+    custom = run_conf().get(ext.lower())
+    if custom is not None:                          # the user's own command for this extension
+        try:
+            args = shlex.split(custom)
+        except ValueError as e:
+            return f"{short_path(RUN_CONF)}: cannot read the {ext} command: {e}"
+        if any("{file}" in a for a in args):
+            args = [a.replace("{file}", path) for a in args]
+        else:
+            args.append(path)
+        exe = shutil.which(args[0])
+        if not exe:
+            return f"{args[0]} is not installed (the {ext} command in {short_path(RUN_CONF)})"
+        return [exe] + args[1:]
     if ext == ".py":
         uv = shutil.which("uv")
         try:

@@ -13,6 +13,7 @@ pane immediately shows the highlighted file's contents — and you can edit and 
 - The top bar shows the current folder; click it (or Ctrl+P) to paste a folder or file path and press Enter to jump there; a file is highlighted and opened
 - Find text in the previewed file with Ctrl+F (F3 or Ctrl+G / Shift+F3 for the next / previous match)
 - Run scripts and programs with Ctrl+R (Python, shell, Node, Perl, anything with a `#!` line, executables): the output streams into the right panel (Esc shows the file again)
+- Other file types: press Ctrl+R on one and fv asks once for the command (e.g. `ruby`, `go run`), saves it in `~/.config/fv/run.conf` and runs it
 - Folders in bright blue, runnable files in bright green
 - Mark several files with Space; copy/paste them with Ctrl+C/Ctrl+V, move them with Ctrl+X/Ctrl+V, delete them with Del (always asks first;
   non-empty folders are never deleted), rename with Ctrl+E (or F2)
@@ -85,6 +86,30 @@ python3 fv.py [DIRECTORY]
 | Ctrl+L | redraw the screen |
 | mouse wheel | scroll the panel under the pointer |
 | Ctrl+Q | quit (with unsaved changes it asks: y = save and quit, n = quit without saving, Esc = cancel) |
+
+## Run commands for other file types
+
+Ctrl+R on a file whose extension fv doesn't know asks *"No command for .rb files yet. Run them with:"*.
+Type the command and press Enter: it runs, and the answer is saved in `~/.config/fv/run.conf`
+(or `$XDG_CONFIG_HOME/fv/run.conf`). Open that file in fv (Ctrl+P and paste its path) to change or add lines:
+
+```
+.rb = ruby
+.go = go run
+.ts = npx tsx
+.c  = sh -c 'cc "$1" -o /tmp/fv-a.out && /tmp/fv-a.out' sh {file}
+```
+
+The file's path is added at the end of the command, or replaces `{file}`. Extensions are matched
+case-insensitively, and these lines win over fv's own choices, so `.py` or `.sh` can be changed too.
+Files with these extensions are shown in green.
+
+## Mouse on a server's text console
+
+Over SSH and in desktop terminals the mouse just works. On the Linux text console (logged in
+directly on the machine, no desktop) there is no mouse pointer at all unless the **gpm** service
+is installed: `sudo apt install gpm`, then restart fv. fv mentions this at startup when it runs on
+the console without gpm.
 
 Copying uses `wl-copy`, `xclip`, `xsel`, `pbcopy` or `clip.exe` when available, and also sends
 OSC 52 (up to 1 MB) so it works over SSH and in tmux, if the terminal allows clipboard writes.
