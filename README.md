@@ -108,7 +108,7 @@ Files with these extensions are shown in green.
 
 Over SSH and in desktop terminals the mouse just works. On the Linux text console (logged in
 directly on the machine, no desktop) there is no mouse pointer at all unless the **gpm** service
-is installed: `sudo apt install gpm`, then restart fv. fv mentions this at startup when it runs on
+is installed and running: `sudo apt install gpm` (if it still doesn't work, `sudo systemctl start gpm`), then restart fv. fv mentions this at startup when it runs on
 the console without gpm.
 
 Copying uses `wl-copy`, `xclip`, `xsel`, `pbcopy` or `clip.exe` when available, and also sends

@@ -582,7 +582,10 @@ class App:
         self.mouse = bool(avail)
         if os.environ.get("TERM") == "linux" and not os.path.exists("/dev/gpmctl"):
             # the Linux text console (no SSH, no desktop) only has a mouse through the gpm service
-            self.status = "no mouse on the text console: install gpm (sudo apt install gpm), then restart fv"
+            if shutil.which("gpm") or os.path.exists("/usr/sbin/gpm"):
+                self.status = "no mouse: the gpm service isn't running (sudo systemctl start gpm), then restart fv"
+            else:
+                self.status = "no mouse on the text console: install gpm (sudo apt install gpm), then restart fv"
         if self.mouse:
             # ncurses only enables mode 1000 (clicks); 1002 adds motion while a button is held
             term_write("\x1b[?1002h")
